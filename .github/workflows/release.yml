@@ -202,7 +202,7 @@ jobs:
   # ── GitHub Release ───────────────────────────────────────────────────────────
   release:
     name: Publish Release
-    needs: [build-macos, build-linux, build-windows]
+    needs: [build-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -218,5 +218,3 @@ jobs:
           generate_release_notes: true
           files: |
             dist/out/**/*.dmg
-            dist/out/**/*.deb
-            dist/out/**/*.exe

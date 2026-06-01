@@ -199,7 +199,7 @@ jobs:
           name: windows-installer
           path: dist/out/RustyBridge-*-windows-setup.exe
 
-  # ── GitHub Release ───────────────────────────────────────────────────────────
+  # ── GitHub Release ─────────────────────────────────────────────────────────
   release:
     name: Publish Release
     needs: [build-macos]

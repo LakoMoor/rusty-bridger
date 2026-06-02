@@ -3,11 +3,11 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver},
-        Arc,
+        mpsc::{self, RecvTimeoutError, Receiver},
+        Arc, Mutex,
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use eframe::egui;
@@ -89,6 +89,53 @@ impl AppSettings {
         if let Ok(s) = serde_json::to_string_pretty(self) {
             let _ = fs::write(Self::path(), s);
         }
+    }
+}
+
+// ── Live tracking state for the rig ──────────────────────────────────────────
+
+#[derive(Default, Clone)]
+struct RigState {
+    face_found: bool,
+    rot_y:   f32,  // yaw   degrees
+    rot_x:   f32,  // pitch degrees
+    rot_z:   f32,  // roll  degrees
+    eye_l:   f32,  // 0 = open, 1 = closed
+    eye_r:   f32,
+    jaw:     f32,  // 0 = closed, 1 = open
+    smile:   f32,  // -1 = frown, 1 = smile
+    brow_l:  f32,  // 0 = down, 1 = raised
+    brow_r:  f32,
+}
+
+impl RigState {
+    fn from_tracking(t: &TrackingResponce) -> Self {
+        let mut s = RigState {
+            face_found: t.face_found,
+            rot_x: t.rotation.x as f32,
+            rot_y: t.rotation.y as f32,
+            rot_z: t.rotation.z as f32,
+            brow_l: 0.5,
+            brow_r: 0.5,
+            ..Default::default()
+        };
+        let (mut sl, mut sr, mut fl, mut fr) = (0.0f32, 0.0, 0.0, 0.0);
+        for shape in &t.blend_shapes {
+            match shape.k.as_str() {
+                "EyeBlinkLeft"     => s.eye_l  = shape.v as f32,
+                "EyeBlinkRight"    => s.eye_r  = shape.v as f32,
+                "JawOpen"          => s.jaw    = shape.v as f32,
+                "MouthSmileLeft"   => sl       = shape.v as f32,
+                "MouthSmileRight"  => sr       = shape.v as f32,
+                "MouthFrownLeft"   => fl       = shape.v as f32,
+                "MouthFrownRight"  => fr       = shape.v as f32,
+                "BrowOuterUpLeft"  => s.brow_l = shape.v as f32,
+                "BrowOuterUpRight" => s.brow_r = shape.v as f32,
+                _ => {}
+            }
+        }
+        s.smile = (sl + sr) / 2.0 - (fl + fr) / 2.0;
+        s
     }
 }
 
@@ -239,13 +286,14 @@ struct App {
     pending_path:    Option<Receiver<Option<String>>>,
     editor:          Editor,
     start_time:      Instant,
+    rig_state:       Arc<Mutex<RigState>>,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext) -> Self {
-        let cfg = Config::load();
+        let cfg      = Config::load();
         let settings = AppSettings::load();
-        let source = match cfg.source.unwrap_or(0) {
+        let source   = match cfg.source.unwrap_or(0) {
             1 => Source::Webcam,
             _ => Source::IPhone,
         };
@@ -262,6 +310,7 @@ impl App {
             pending_path:    None,
             editor:          Editor::default(),
             start_time:      Instant::now(),
+            rig_state:       Arc::new(Mutex::new(RigState::default())),
             settings_status: String::new(),
             settings_draft,
             settings,
@@ -279,7 +328,29 @@ impl App {
 
     fn connect(&mut self) {
         self.active.store(true, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel::<TrackingResponce>();
+
+        // tracker → relay channel, relay → vtspc channel
+        let (track_tx, track_rx) = mpsc::channel::<TrackingResponce>();
+        let (vts_tx,   vts_rx)   = mpsc::channel::<TrackingResponce>();
+
+        // Relay: tap tracking data into shared RigState, then forward to VtsPc
+        let relay_flag = Arc::clone(&self.active);
+        let rig_state  = Arc::clone(&self.rig_state);
+        thread::spawn(move || {
+            while relay_flag.load(Ordering::Relaxed) {
+                match track_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(data) => {
+                        if let Ok(mut g) = rig_state.lock() {
+                            *g = RigState::from_tracking(&data);
+                        }
+                        let _ = vts_tx.send(data);
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+            }
+        });
+
         let flag  = Arc::clone(&self.active);
         let flag2 = Arc::clone(&self.active);
         let path  = self.transform_path.clone();
@@ -287,18 +358,22 @@ impl App {
         match self.source {
             Source::IPhone => {
                 let ip = self.phone_ip.clone();
-                thread::spawn(move || VtsPhone::run(ip, tx, flag2));
+                thread::spawn(move || VtsPhone::run(ip, track_tx, flag2));
             }
             Source::Webcam => {
                 let idx = self.selected_cam;
-                thread::spawn(move || WebcamTracker::run(idx, tx, flag2));
+                thread::spawn(move || WebcamTracker::run(idx, track_tx, flag2));
             }
         }
-        thread::spawn(move || VtsPc::run(rx, path, flag));
+        thread::spawn(move || VtsPc::run(vts_rx, path, flag));
     }
 
     fn disconnect(&mut self) {
         self.active.store(false, Ordering::Relaxed);
+        // Reset rig state so it goes back to idle
+        if let Ok(mut g) = self.rig_state.lock() {
+            *g = RigState::default();
+        }
     }
 
     fn open_file_dialog(&mut self) {
@@ -323,12 +398,12 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Apply live theme preview from draft
         apply_theme(ctx, &self.settings_draft.theme);
 
-        // Animate webcam rig continuously when webcam tab is visible
-        if self.tab == Tab::Bridge && self.source == Source::Webcam {
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        // Continuously repaint while bridge is connected (live rig animation)
+        let connected = self.active.load(Ordering::Relaxed);
+        if connected && self.tab == Tab::Bridge {
+            ctx.request_repaint_after(Duration::from_millis(33));
         }
 
         // Poll async file dialog
@@ -344,9 +419,12 @@ impl eframe::App for App {
             }
         }
 
-        let connected = self.active.load(Ordering::Relaxed);
+        // Snapshot rig state (non-blocking)
+        let rig = self.rig_state.try_lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
 
-        // ── Tab bar (top) ──────────────────────────────────────────────────
+        // ── Tab bar ────────────────────────────────────────────────────────
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -359,7 +437,7 @@ impl eframe::App for App {
             ui.add_space(2.0);
         });
 
-        // ── Status bar (bottom) ────────────────────────────────────────────
+        // ── Status bar ─────────────────────────────────────────────────────
         egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
             ui.add_space(3.0);
             ui.horizontal(|ui| {
@@ -381,20 +459,18 @@ impl eframe::App for App {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("v{VERSION}"))
-                            .small().color(egui::Color32::from_gray(80)),
-                    );
+                    ui.label(egui::RichText::new(format!("v{VERSION}"))
+                        .small().color(egui::Color32::from_gray(80)));
                 });
             });
             ui.add_space(3.0);
         });
 
-        // ── Main content ───────────────────────────────────────────────────
+        // ── Central panel ──────────────────────────────────────────────────
+        let elapsed = self.start_time.elapsed().as_secs_f32();
         egui::CentralPanel::default().show(ctx, |ui| {
-            let elapsed = self.start_time.elapsed().as_secs_f32();
             match self.tab {
-                Tab::Bridge   => bridge_ui(ui, self, connected, elapsed),
+                Tab::Bridge   => bridge_ui(ui, self, connected, elapsed, &rig),
                 Tab::Config   => config_editor_ui(ui, &mut self.editor, &mut self.transform_path, &mut self.cfg),
                 Tab::Settings => settings_ui(ui, &mut self.settings, &mut self.settings_draft, &mut self.settings_status),
                 Tab::About    => about_ui(ui),
@@ -408,165 +484,14 @@ impl eframe::App for App {
 fn apply_theme(ctx: &egui::Context, theme: &str) {
     match theme {
         "light" => ctx.set_visuals(egui::Visuals::light()),
-        _ => ctx.set_visuals(egui::Visuals::dark()),
-    }
-}
-
-// ── Webcam face rig preview ───────────────────────────────────────────────────
-
-fn draw_webcam_rig(ui: &mut egui::Ui, connected: bool, t: f32) {
-    let avail_w = ui.available_width();
-    let rig_w   = avail_w.min(200.0).max(140.0);
-    let rig_h   = rig_w * 1.15;
-
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(rig_w, rig_h), egui::Sense::hover());
-    let painter   = ui.painter_at(rect);
-
-    // Background
-    painter.rect_filled(rect, 10.0, egui::Color32::from_rgb(10, 14, 22));
-    painter.rect_stroke(rect, 10.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(35, 55, 75)));
-
-    let center = rect.center();
-    let s = |v: f32| v * (rig_w / 200.0);
-
-    let rig_col = if connected {
-        egui::Color32::from_rgb(60, 210, 110)
-    } else {
-        egui::Color32::from_rgb(55, 130, 210)
-    };
-    let dim = rig_col.linear_multiply(0.35);
-    let lmk = rig_col.linear_multiply(0.75);
-
-    // Head oval
-    painter.add(egui::Shape::Ellipse(egui::epaint::EllipseShape {
-        center: center + egui::vec2(0.0, s(4.0)),
-        radius: egui::vec2(s(62.0), s(72.0)),
-        fill:   egui::Color32::TRANSPARENT,
-        stroke: egui::Stroke::new(1.5, dim),
-    }));
-
-    // Blink every ~5 seconds for ~0.12s
-    let blink = (t * 1.26).sin() > 0.993;
-    let eye_h  = if blink { s(1.0) } else { s(9.0) };
-    let eye_h2 = if blink { s(0.8) } else { s(7.0) };
-
-    // Eyes
-    for ex in [-1.0_f32, 1.0] {
-        let ep = center + egui::vec2(s(ex * 22.0), s(-6.0));
-        painter.add(egui::Shape::Ellipse(egui::epaint::EllipseShape {
-            center: ep,
-            radius: egui::vec2(s(12.0), eye_h),
-            fill:   egui::Color32::TRANSPARENT,
-            stroke: egui::Stroke::new(1.5, rig_col),
-        }));
-        if !blink {
-            // Iris
-            painter.add(egui::Shape::Ellipse(egui::epaint::EllipseShape {
-                center: ep + egui::vec2(s(0.5), s(1.0)),
-                radius: egui::vec2(s(5.0), eye_h2 * 0.65),
-                fill:   egui::Color32::TRANSPARENT,
-                stroke: egui::Stroke::new(1.0, rig_col.linear_multiply(0.6)),
-            }));
-            painter.circle_filled(ep + egui::vec2(s(0.5), s(1.0)), s(2.5), rig_col);
-        }
-
-        // Eyebrow
-        let brow_y = center.y + s(-24.0);
-        let raise   = if connected { (t * 0.7).sin() * s(1.5) } else { 0.0 };
-        let bx      = ex * s(22.0);
-        painter.add(egui::Shape::line(
-            vec![
-                egui::pos2(center.x + bx - s(10.0) * ex, brow_y + s(3.0) - raise),
-                egui::pos2(center.x + bx,                 brow_y - raise),
-                egui::pos2(center.x + bx + s(10.0) * ex,  brow_y + s(2.0) - raise),
-            ],
-            egui::Stroke::new(1.5, rig_col.linear_multiply(0.85)),
-        ));
-    }
-
-    // Nose bridge + nostrils
-    let nt = center + egui::vec2(0.0, s(-1.0));
-    let nl = center + egui::vec2(s(-6.0), s(14.0));
-    let nr = center + egui::vec2(s(6.0), s(14.0));
-    painter.add(egui::Shape::line(vec![nt, nl], egui::Stroke::new(1.0, dim)));
-    painter.add(egui::Shape::line(vec![nt, nr], egui::Stroke::new(1.0, dim)));
-    painter.circle_stroke(nl + egui::vec2(s(-3.0), 0.0), s(3.5), egui::Stroke::new(1.0, dim));
-    painter.circle_stroke(nr + egui::vec2(s(3.0), 0.0),  s(3.5), egui::Stroke::new(1.0, dim));
-
-    // Mouth — subtle smile oscillation when connected
-    let mouth_y  = center.y + s(28.0);
-    let smile_d  = if connected { (t * 0.4).sin() * s(1.5) } else { 0.0 };
-    let mouth_pts: Vec<egui::Pos2> = (-5..=5).map(|i| {
-        let tt = i as f32 / 5.0;
-        egui::pos2(center.x + tt * s(18.0), mouth_y + tt * tt * s(5.0) - smile_d)
-    }).collect();
-    painter.add(egui::Shape::line(mouth_pts, egui::Stroke::new(1.5, rig_col)));
-
-    // Outline landmark dots
-    const DOTS: &[(f32, f32)] = &[
-        (-62.0, 4.0), (62.0, 4.0),
-        (-46.0, -42.0), (46.0, -42.0),
-        (0.0, -72.0),
-        (-48.0, 38.0), (48.0, 38.0),
-        (-28.0, 64.0), (28.0, 64.0),
-        (0.0, 74.0),
-    ];
-    for &(dx, dy) in DOTS {
-        let pulse = if connected { (t * 1.8 + dx * 0.05).sin() * 0.5 + 0.5 } else { 0.85 };
-        painter.circle_filled(
-            center + egui::vec2(s(dx), s(dy)),
-            s(2.2),
-            lmk.linear_multiply(pulse),
-        );
-    }
-
-    // Camera-rig corner brackets
-    let cs = s(14.0);
-    let cc = egui::Color32::from_rgb(90, 160, 255).linear_multiply(0.8);
-    let corners: [(egui::Pos2, f32, f32); 4] = [
-        (rect.min,                                          1.0,  1.0),
-        (egui::pos2(rect.max.x, rect.min.y),              -1.0,  1.0),
-        (egui::pos2(rect.min.x, rect.max.y),               1.0, -1.0),
-        (rect.max,                                         -1.0, -1.0),
-    ];
-    for (pos, sx, sy) in corners {
-        painter.line_segment(
-            [pos, egui::pos2(pos.x + sx * cs, pos.y)],
-            egui::Stroke::new(2.0, cc),
-        );
-        painter.line_segment(
-            [pos, egui::pos2(pos.x, pos.y + sy * cs)],
-            egui::Stroke::new(2.0, cc),
-        );
-    }
-
-    // Status overlay
-    if connected {
-        let lp = rect.min + egui::vec2(s(9.0), s(9.0));
-        let pulse = (t * 2.0).sin() * 0.35 + 0.65;
-        painter.circle_filled(lp, s(4.0), egui::Color32::from_rgb(80, 220, 100).linear_multiply(pulse));
-        painter.text(
-            lp + egui::vec2(s(8.0), 0.0),
-            egui::Align2::LEFT_CENTER,
-            "LIVE",
-            egui::FontId::monospace(9.0),
-            egui::Color32::from_rgb(80, 220, 100),
-        );
-    } else {
-        painter.text(
-            rect.center_bottom() + egui::vec2(0.0, -s(10.0)),
-            egui::Align2::CENTER_CENTER,
-            "face rig preview",
-            egui::FontId::proportional(9.5),
-            egui::Color32::from_gray(65),
-        );
+        _       => ctx.set_visuals(egui::Visuals::dark()),
     }
 }
 
 // ── Bridge tab ────────────────────────────────────────────────────────────────
 
-fn bridge_ui(ui: &mut egui::Ui, app: &mut App, connected: bool, elapsed: f32) {
-    ui.add_space(8.0);
+fn bridge_ui(ui: &mut egui::Ui, app: &mut App, connected: bool, elapsed: f32, rig: &RigState) {
+    ui.add_space(6.0);
 
     // Source selector
     ui.horizontal(|ui| {
@@ -578,107 +503,58 @@ fn bridge_ui(ui: &mut egui::Ui, app: &mut App, connected: bool, elapsed: f32) {
 
     ui.add_space(6.0);
 
-    // If Webcam: side-by-side layout (controls | rig)
-    if app.source == Source::Webcam {
-        ui.horizontal(|ui| {
-            // Controls column
-            ui.vertical(|ui| {
-                ui.set_width(ui.available_width() - 210.0);
-                webcam_controls(ui, app, connected);
-            });
+    // Transform path
+    ui.horizontal(|ui| {
+        let r = ui.add_sized(
+            [ui.available_width() - 42.0, 22.0],
+            egui::TextEdit::singleline(&mut app.transform_path)
+                .hint_text("Transform config (.json)")
+                .interactive(!connected),
+        );
+        if r.changed() { app.save_config(); }
+        if ui.add_enabled(!connected,
+            egui::Button::new("📂").min_size([36.0, 22.0].into())
+        ).on_hover_text("Browse…").clicked() {
+            app.open_file_dialog();
+        }
+    });
 
-            ui.add_space(6.0);
-
-            // Rig preview column
-            ui.vertical(|ui| {
-                draw_webcam_rig(ui, connected, elapsed);
-            });
-        });
-    } else {
-        iphone_controls(ui, app, connected);
-    }
-
-    ui.add_space(6.0);
-    ui.separator();
     ui.add_space(4.0);
-    ui.label(
-        egui::RichText::new("github.com/LakoMoor/rusty-bridger")
-            .small().color(egui::Color32::from_gray(90)),
-    );
-}
 
-fn iphone_controls(ui: &mut egui::Ui, app: &mut App, connected: bool) {
-    // Transform path
-    ui.horizontal(|ui| {
-        let r = ui.add_sized(
-            [ui.available_width() - 42.0, 22.0],
-            egui::TextEdit::singleline(&mut app.transform_path)
-                .hint_text("Transform config (.json)")
-                .interactive(!connected),
-        );
-        if r.changed() { app.save_config(); }
-        if ui.add_enabled(!connected,
-            egui::Button::new("📂").min_size([36.0, 22.0].into())
-        ).on_hover_text("Browse…").clicked() {
-            app.open_file_dialog();
+    // Source-specific input
+    match app.source {
+        Source::IPhone => {
+            let r = ui.add_sized(
+                [ui.available_width(), 22.0],
+                egui::TextEdit::singleline(&mut app.phone_ip)
+                    .hint_text("iPhone IP  (e.g. 192.168.1.10)")
+                    .interactive(!connected),
+            );
+            if r.changed() { app.save_config(); }
         }
-    });
-    ui.add_space(6.0);
-
-    // iPhone IP
-    let r = ui.add_sized(
-        [ui.available_width(), 22.0],
-        egui::TextEdit::singleline(&mut app.phone_ip)
-            .hint_text("iPhone IP  (e.g. 192.168.1.10)")
-            .interactive(!connected),
-    );
-    if r.changed() { app.save_config(); }
-    ui.add_space(12.0);
-
-    connect_button(ui, app, connected);
-}
-
-fn webcam_controls(ui: &mut egui::Ui, app: &mut App, connected: bool) {
-    // Transform path
-    ui.horizontal(|ui| {
-        let r = ui.add_sized(
-            [ui.available_width() - 42.0, 22.0],
-            egui::TextEdit::singleline(&mut app.transform_path)
-                .hint_text("Transform config (.json)")
-                .interactive(!connected),
-        );
-        if r.changed() { app.save_config(); }
-        if ui.add_enabled(!connected,
-            egui::Button::new("📂").min_size([36.0, 22.0].into())
-        ).on_hover_text("Browse…").clicked() {
-            app.open_file_dialog();
-        }
-    });
-    ui.add_space(6.0);
-
-    // Camera selector
-    let snap: Vec<_> = app.cameras.clone();
-    let name = snap.iter().find(|(i, _)| *i == app.selected_cam)
-        .map(|(_, n)| n.as_str()).unwrap_or("No cameras found");
-    let mut new_cam = app.selected_cam;
-    egui::ComboBox::from_id_salt("cam")
-        .width(ui.available_width())
-        .selected_text(name)
-        .show_ui(ui, |ui| {
-            for (idx, n) in &snap {
-                ui.selectable_value(&mut new_cam, *idx, n);
+        Source::Webcam => {
+            let snap: Vec<_> = app.cameras.clone();
+            let name = snap.iter().find(|(i, _)| *i == app.selected_cam)
+                .map(|(_, n)| n.as_str()).unwrap_or("No cameras found");
+            let mut new_cam = app.selected_cam;
+            egui::ComboBox::from_id_salt("cam")
+                .width(ui.available_width())
+                .selected_text(name)
+                .show_ui(ui, |ui| {
+                    for (idx, n) in &snap {
+                        ui.selectable_value(&mut new_cam, *idx, n);
+                    }
+                });
+            if new_cam != app.selected_cam {
+                app.selected_cam = new_cam;
+                app.save_config();
             }
-        });
-    if new_cam != app.selected_cam {
-        app.selected_cam = new_cam;
-        app.save_config();
+        }
     }
-    ui.add_space(12.0);
 
-    connect_button(ui, app, connected);
-}
+    ui.add_space(8.0);
 
-fn connect_button(ui: &mut egui::Ui, app: &mut App, connected: bool) {
+    // Connect / Disconnect button
     let can   = app.can_connect();
     let label = if connected { "Disconnect" } else { "Connect" };
     if ui.add_enabled(connected || can,
@@ -686,8 +562,10 @@ fn connect_button(ui: &mut egui::Ui, app: &mut App, connected: bool) {
     ).clicked() {
         if connected { app.disconnect(); } else { app.connect(); }
     }
-    ui.add_space(8.0);
 
+    ui.add_space(6.0);
+
+    // Status line
     if !connected {
         let hint = if app.transform_path.is_empty() {
             "① Browse or paste a transform config path"
@@ -696,8 +574,240 @@ fn connect_button(ui: &mut egui::Ui, app: &mut App, connected: bool) {
         } else {
             "② Press Connect — make sure VTube Studio is open"
         };
-        ui.label(egui::RichText::new(hint).small().color(egui::Color32::from_gray(135)));
+        ui.label(egui::RichText::new(hint).small().color(egui::Color32::from_gray(130)));
+    } else if app.source == Source::Webcam {
+        let det = app_dir().join("face_det.onnx");
+        let lmk = app_dir().join("face_lmk.onnx");
+        let models_ready = det.exists()
+            && det.metadata().map(|m| m.len() > 4096).unwrap_or(false)
+            && lmk.exists()
+            && lmk.metadata().map(|m| m.len() > 4096).unwrap_or(false);
+
+        let (col, msg) = if !models_ready {
+            (egui::Color32::from_rgb(240, 180, 50), "Downloading ONNX models… (first run, ~3 MB)")
+        } else if rig.face_found {
+            (egui::Color32::from_rgb(80, 200, 100), "Face tracking active")
+        } else {
+            (egui::Color32::from_gray(140), "No face detected — look at the camera")
+        };
+        ui.label(egui::RichText::new(msg).small().color(col));
+    } else if connected {
+        ui.label(egui::RichText::new("Waiting for VTube Studio…").small().color(egui::Color32::from_gray(130)));
     }
+
+    ui.add_space(4.0);
+
+    // Webcam rig preview — fills remaining space
+    if app.source == Source::Webcam {
+        ui.separator();
+        let avail = ui.available_size();
+        draw_webcam_rig(ui, rig, elapsed, avail);
+    } else {
+        ui.separator();
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("github.com/LakoMoor/rusty-bridger")
+            .small().color(egui::Color32::from_gray(85)));
+    }
+}
+
+// ── Webcam face rig ───────────────────────────────────────────────────────────
+
+fn draw_webcam_rig(ui: &mut egui::Ui, rig: &RigState, t: f32, avail: egui::Vec2) {
+    let rig_w = avail.x;
+    let rig_h = avail.y.max(160.0);
+
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(rig_w, rig_h), egui::Sense::hover());
+    let painter   = ui.painter_at(rect);
+
+    // Background
+    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(10, 14, 22));
+
+    // Scale helper — relative to the smaller dimension so the rig fits
+    let base   = rig_w.min(rig_h);
+    let s      = |v: f32| v * (base / 280.0);
+    let center = rect.center();
+
+    // Colors — green when tracking, blue when idle
+    let (rig_col, dim) = if rig.face_found {
+        let c = egui::Color32::from_rgb(55, 210, 100);
+        (c, c.linear_multiply(0.30))
+    } else {
+        let c = egui::Color32::from_rgb(60, 130, 210);
+        (c, c.linear_multiply(0.30))
+    };
+    let lmk = rig_col.linear_multiply(0.65);
+
+    // ── Head position offset from rotation ────────────────────────────────
+    let yaw_off   = (rig.rot_y / 40.0).clamp(-1.0, 1.0) * s(30.0);
+    let pitch_off = (rig.rot_x / 40.0).clamp(-1.0, 1.0) * s(22.0);
+    let fc        = center + egui::vec2(yaw_off, pitch_off);
+
+    // Perspective squish: face appears narrower when turned
+    let yaw_t  = (rig.rot_y.abs() / 60.0).clamp(0.0, 0.55);
+    let head_rx = s(62.0) * (1.0 - yaw_t * 0.35);
+
+    // ── Head outline ──────────────────────────────────────────────────────
+    painter.add(egui::Shape::Ellipse(egui::epaint::EllipseShape {
+        center: fc + egui::vec2(0.0, s(4.0)),
+        radius: egui::vec2(head_rx, s(74.0)),
+        fill:   egui::Color32::TRANSPARENT,
+        stroke: egui::Stroke::new(1.5, dim),
+    }));
+
+    // ── Eyes ──────────────────────────────────────────────────────────────
+    // When not tracking fall back to idle blink animation
+    let (open_l, open_r) = if rig.face_found {
+        (1.0 - rig.eye_l, 1.0 - rig.eye_r)
+    } else {
+        let blink = (t * 1.3).sin() > 0.992;
+        let v = if blink { 0.0_f32 } else { 1.0 };
+        (v, v)
+    };
+
+    for (ex, eye_open) in [(-1.0_f32, open_l), (1.0, open_r)] {
+        let ep   = fc + egui::vec2(s(ex * 22.0), s(-8.0));
+        let ew   = s(13.0);
+        let eh   = (s(9.5) * eye_open.max(0.04)).max(1.0);
+
+        painter.add(egui::Shape::Ellipse(egui::epaint::EllipseShape {
+            center: ep, radius: egui::vec2(ew, eh),
+            fill: egui::Color32::TRANSPARENT,
+            stroke: egui::Stroke::new(1.5, rig_col),
+        }));
+
+        if eye_open > 0.25 {
+            // Iris ring
+            painter.add(egui::Shape::Ellipse(egui::epaint::EllipseShape {
+                center: ep + egui::vec2(s(0.5), s(0.5)),
+                radius: egui::vec2(s(5.5), eh * 0.65),
+                fill: egui::Color32::TRANSPARENT,
+                stroke: egui::Stroke::new(1.0, rig_col.linear_multiply(0.55)),
+            }));
+            // Pupil
+            painter.circle_filled(ep + egui::vec2(s(0.5), s(0.5)), s(2.8), rig_col);
+        }
+
+        // Eyebrow — raised by actual brow blend shape value
+        let brow_raise = if rig.face_found {
+            if ex < 0.0 { rig.brow_l } else { rig.brow_r }
+        } else {
+            0.5 + (t * 0.6).sin() * 0.05  // subtle idle sway
+        };
+        let by  = fc.y + s(-26.0) - (brow_raise - 0.5) * s(10.0);
+        let bx  = ex * s(22.0);
+        painter.add(egui::Shape::line(
+            vec![
+                egui::pos2(fc.x + bx - s(11.0) * ex, by + s(3.0)),
+                egui::pos2(fc.x + bx,                  by),
+                egui::pos2(fc.x + bx + s(11.0) * ex,   by + s(2.0)),
+            ],
+            egui::Stroke::new(1.8, rig_col.linear_multiply(0.88)),
+        ));
+    }
+
+    // ── Nose ──────────────────────────────────────────────────────────────
+    let nt = fc + egui::vec2(0.0, s(-1.0));
+    let nl = fc + egui::vec2(s(-6.5), s(14.0));
+    let nr = fc + egui::vec2(s(6.5),  s(14.0));
+    for (a, b) in [(nt, nl), (nt, nr)] {
+        painter.add(egui::Shape::line(vec![a, b], egui::Stroke::new(1.0, dim)));
+    }
+    painter.circle_stroke(nl + egui::vec2(s(-3.2), 0.0), s(3.5), egui::Stroke::new(1.0, dim));
+    painter.circle_stroke(nr + egui::vec2(s(3.2),  0.0), s(3.5), egui::Stroke::new(1.0, dim));
+
+    // ── Mouth ─────────────────────────────────────────────────────────────
+    let jaw_v   = if rig.face_found { rig.jaw   } else { 0.0 };
+    let smile_v = if rig.face_found { rig.smile } else { (t * 0.25).sin() * 0.08 };
+    let mouth_y = fc.y + s(29.0);
+    let open_h  = jaw_v * s(14.0);
+    let sc      = smile_v * s(5.0);
+
+    // Upper lip
+    let upper: Vec<egui::Pos2> = (-5..=5).map(|i| {
+        let tt = i as f32 / 5.0;
+        egui::pos2(fc.x + tt * s(19.0), mouth_y - tt * tt * sc.abs() * smile_v.signum() * 0.4)
+    }).collect();
+    painter.add(egui::Shape::line(upper, egui::Stroke::new(1.6, rig_col)));
+
+    if jaw_v > 0.04 {
+        // Lower lip
+        let lower: Vec<egui::Pos2> = (-5..=5).map(|i| {
+            let tt = i as f32 / 5.0;
+            egui::pos2(fc.x + tt * s(19.0), mouth_y + open_h + tt * tt * sc * 0.3)
+        }).collect();
+        painter.add(egui::Shape::line(lower, egui::Stroke::new(1.3, rig_col.linear_multiply(0.75))));
+        painter.line_segment(
+            [egui::pos2(fc.x - s(19.0), mouth_y), egui::pos2(fc.x - s(19.0), mouth_y + open_h)],
+            egui::Stroke::new(1.0, rig_col.linear_multiply(0.5)),
+        );
+        painter.line_segment(
+            [egui::pos2(fc.x + s(19.0), mouth_y), egui::pos2(fc.x + s(19.0), mouth_y + open_h)],
+            egui::Stroke::new(1.0, rig_col.linear_multiply(0.5)),
+        );
+    }
+
+    // ── Contour landmark dots ─────────────────────────────────────────────
+    const DOTS: &[(f32, f32)] = &[
+        (-62.0, 4.0), (62.0, 4.0),
+        (-46.0, -44.0), (46.0, -44.0),
+        (0.0, -74.0),
+        (-50.0, 36.0), (50.0, 36.0),
+        (-30.0, 64.0), (30.0, 64.0),
+        (0.0, 76.0),
+    ];
+    for &(dx, dy) in DOTS {
+        let pulse = if rig.face_found {
+            (t * 2.0 + dx.abs() * 0.03).sin() * 0.3 + 0.7
+        } else { 0.45 };
+        painter.circle_filled(fc + egui::vec2(s(dx), s(dy)), s(2.4), lmk.linear_multiply(pulse));
+    }
+
+    // ── Camera-rig corner brackets ─────────────────────────────────────────
+    let cs  = s(16.0);
+    let cc  = egui::Color32::from_rgb(85, 155, 255).linear_multiply(0.75);
+    let brt = [(rect.min, 1.0_f32, 1.0_f32),
+               (egui::pos2(rect.max.x, rect.min.y), -1.0, 1.0),
+               (egui::pos2(rect.min.x, rect.max.y),  1.0, -1.0),
+               (rect.max, -1.0, -1.0)];
+    for (pos, sx, sy) in brt {
+        painter.line_segment([pos, egui::pos2(pos.x + sx * cs, pos.y)], egui::Stroke::new(2.0, cc));
+        painter.line_segment([pos, egui::pos2(pos.x, pos.y + sy * cs)], egui::Stroke::new(2.0, cc));
+    }
+
+    // ── Overlays ──────────────────────────────────────────────────────────
+    if rig.face_found {
+        let lp    = rect.min + egui::vec2(10.0, 10.0);
+        let pulse = (t * 2.2).sin() * 0.3 + 0.7;
+        painter.circle_filled(lp, 5.0, egui::Color32::from_rgb(70, 220, 100).linear_multiply(pulse));
+        painter.text(lp + egui::vec2(10.0, 0.0), egui::Align2::LEFT_CENTER,
+            "TRACKING", egui::FontId::monospace(9.0), egui::Color32::from_rgb(70, 220, 100));
+
+        // Compact rotation readout
+        painter.text(
+            rect.min + egui::vec2(10.0, 22.0),
+            egui::Align2::LEFT_CENTER,
+            format!("Y{:+.0}° P{:+.0}° R{:+.0}°", rig.rot_y, rig.rot_x, rig.rot_z),
+            egui::FontId::monospace(8.5),
+            egui::Color32::from_gray(95),
+        );
+    } else {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "No face detected",
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_gray(70),
+        );
+    }
+
+    // Bottom label
+    painter.text(
+        rect.center_bottom() + egui::vec2(0.0, -8.0),
+        egui::Align2::CENTER_CENTER,
+        "face rig preview",
+        egui::FontId::proportional(9.0),
+        egui::Color32::from_gray(45),
+    );
 }
 
 // ── Config editor tab ─────────────────────────────────────────────────────────
@@ -708,7 +818,6 @@ fn config_editor_ui(
     path: &mut String,
     cfg: &mut Config,
 ) {
-    // Toolbar
     ui.horizontal(|ui| {
         if ui.button("📂 Load").clicked() {
             if let Some(p) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
@@ -736,7 +845,6 @@ fn config_editor_ui(
             ed.dirty = false;
             ed.status = "New config — save when ready".into();
         }
-
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let col = if ed.status.contains("error") || ed.status.contains("Error") {
                 egui::Color32::from_rgb(220, 80, 80)
@@ -753,170 +861,118 @@ fn config_editor_ui(
 
     let avail = ui.available_height();
     ui.horizontal(|ui| {
-        // ── Left: param list ────────────────────────────────────────────
         ui.vertical(|ui| {
             ui.set_width(170.0);
-
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Parameters").strong().small());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let has_sel  = ed.selected.is_some();
-                    let not_last = ed.selected.map_or(false, |i| i + 1 < ed.params.len());
+                    let has  = ed.selected.is_some();
+                    let not_last  = ed.selected.map_or(false, |i| i + 1 < ed.params.len());
                     let not_first = ed.selected.map_or(false, |i| i > 0);
-
-                    if ui.add_enabled(has_sel && not_last, egui::Button::new("↓").small())
-                        .on_hover_text("Move down").clicked() { ed.move_selected(false); }
-                    if ui.add_enabled(has_sel && not_first, egui::Button::new("↑").small())
-                        .on_hover_text("Move up").clicked() { ed.move_selected(true); }
-                    if ui.add_enabled(has_sel, egui::Button::new("🗑").small())
-                        .on_hover_text("Delete").clicked() { ed.delete_selected(); }
-                    if ui.small_button("＋").on_hover_text("Add param").clicked() {
-                        ed.add_param();
-                    }
+                    if ui.add_enabled(has && not_last,  egui::Button::new("↓").small()).clicked() { ed.move_selected(false); }
+                    if ui.add_enabled(has && not_first, egui::Button::new("↑").small()).clicked() { ed.move_selected(true); }
+                    if ui.add_enabled(has, egui::Button::new("🗑").small()).clicked() { ed.delete_selected(); }
+                    if ui.small_button("＋").clicked() { ed.add_param(); }
                 });
             });
             ui.separator();
-
-            egui::ScrollArea::vertical()
-                .max_height(avail - 36.0)
-                .show(ui, |ui| {
-                    ui.set_width(160.0);
-                    for i in 0..ed.params.len() {
-                        let sel = ed.selected == Some(i);
-                        let col = if sel { egui::Color32::WHITE } else { egui::Color32::from_gray(200) };
-                        let label = egui::RichText::new(&ed.params[i].name).monospace().small().color(col);
-                        if ui.selectable_label(sel, label).clicked() && !sel {
-                            ed.apply_edit();
-                            ed.select(i);
-                        }
+            egui::ScrollArea::vertical().max_height(avail - 36.0).show(ui, |ui| {
+                ui.set_width(160.0);
+                for i in 0..ed.params.len() {
+                    let sel = ed.selected == Some(i);
+                    let col = if sel { egui::Color32::WHITE } else { egui::Color32::from_gray(200) };
+                    let lbl = egui::RichText::new(&ed.params[i].name).monospace().small().color(col);
+                    if ui.selectable_label(sel, lbl).clicked() && !sel {
+                        ed.apply_edit(); ed.select(i);
                     }
-                    if ed.params.is_empty() {
-                        ui.label(
-                            egui::RichText::new("No params.\nPress ＋ to add one.")
-                                .small().color(egui::Color32::from_gray(130)),
-                        );
-                    }
-                });
+                }
+                if ed.params.is_empty() {
+                    ui.label(egui::RichText::new("No params.\nPress ＋ to add one.").small().color(egui::Color32::from_gray(130)));
+                }
+            });
         });
 
         ui.separator();
 
-        // ── Right: param editor ─────────────────────────────────────────
         ui.vertical(|ui| {
             if ed.selected.is_none() {
                 ui.add_space(60.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(
-                        egui::RichText::new("← Select a parameter to edit")
-                            .color(egui::Color32::from_gray(140)),
-                    );
+                    ui.label(egui::RichText::new("← Select a parameter to edit").color(egui::Color32::from_gray(140)));
                 });
                 return;
             }
-
             let w = ui.available_width();
-
-            egui::Grid::new("param_grid")
-                .num_columns(2)
-                .spacing([8.0, 5.0])
-                .min_col_width(56.0)
-                .show(ui, |ui| {
-                    ui.label("Name");
-                    ui.horizontal(|ui| {
-                        let r = ui.add_sized(
-                            [w - 80.0, 22.0],
-                            egui::TextEdit::singleline(&mut ed.buf_name),
-                        );
-                        if r.changed() { ed.apply_edit(); ed.validate_buffers(); }
-                        if ed.name_dup {
-                            ui.label(egui::RichText::new("⚠ dup").small()
-                                .color(egui::Color32::from_rgb(240, 160, 30)));
-                        }
-                    });
-                    ui.end_row();
-
-                    ui.label("Formula");
-                    ui.horizontal(|ui| {
-                        let r = ui.add_sized(
-                            [w - 80.0, 22.0],
-                            egui::TextEdit::singleline(&mut ed.buf_func)
-                                .font(egui::TextStyle::Monospace)
-                                .hint_text("HeadRotY * -1"),
-                        );
-                        if r.changed() { ed.apply_edit(); ed.validate_buffers(); }
-                        match ed.formula_ok {
-                            Some(true)  => { ui.label(egui::RichText::new("✓").color(egui::Color32::from_rgb(80, 200, 100))); }
-                            Some(false) => { ui.label(egui::RichText::new("✗").color(egui::Color32::from_rgb(220, 80, 80))); }
-                            None => {}
-                        }
-                    });
-                    ui.end_row();
-
-                    ui.label("Range");
-                    ui.horizontal(|ui| {
-                        let fw = (w - 100.0) / 3.0;
-                        ui.label(egui::RichText::new("min").small().color(egui::Color32::from_gray(160)));
-                        let r = ui.add_sized([fw, 20.0], egui::TextEdit::singleline(&mut ed.buf_min));
-                        if r.changed() { ed.apply_edit(); ed.validate_buffers(); }
-                        ui.label(egui::RichText::new("max").small().color(egui::Color32::from_gray(160)));
-                        let r = ui.add_sized([fw, 20.0], egui::TextEdit::singleline(&mut ed.buf_max));
-                        if r.changed() { ed.apply_edit(); ed.validate_buffers(); }
-                        ui.label(egui::RichText::new("def").small().color(egui::Color32::from_gray(160)));
-                        let r = ui.add_sized([fw, 20.0], egui::TextEdit::singleline(&mut ed.buf_default));
-                        if r.changed() { ed.apply_edit(); ed.validate_buffers(); }
-                    });
-                    ui.end_row();
+            egui::Grid::new("param_grid").num_columns(2).spacing([8.0, 5.0]).min_col_width(56.0).show(ui, |ui| {
+                ui.label("Name");
+                ui.horizontal(|ui| {
+                    let r = ui.add_sized([w - 80.0, 22.0], egui::TextEdit::singleline(&mut ed.buf_name));
+                    if r.changed() { ed.apply_edit(); ed.validate_buffers(); }
+                    if ed.name_dup { ui.label(egui::RichText::new("⚠ dup").small().color(egui::Color32::from_rgb(240,160,30))); }
                 });
-
+                ui.end_row();
+                ui.label("Formula");
+                ui.horizontal(|ui| {
+                    let r = ui.add_sized([w - 80.0, 22.0],
+                        egui::TextEdit::singleline(&mut ed.buf_func).font(egui::TextStyle::Monospace).hint_text("HeadRotY * -1"));
+                    if r.changed() { ed.apply_edit(); ed.validate_buffers(); }
+                    match ed.formula_ok {
+                        Some(true)  => { ui.label(egui::RichText::new("✓").color(egui::Color32::from_rgb(80,200,100))); }
+                        Some(false) => { ui.label(egui::RichText::new("✗").color(egui::Color32::from_rgb(220,80,80))); }
+                        None => {}
+                    }
+                });
+                ui.end_row();
+                ui.label("Range");
+                ui.horizontal(|ui| {
+                    let fw = (w - 100.0) / 3.0;
+                    let mut changed = false;
+                    ui.label(egui::RichText::new("min").small().color(egui::Color32::from_gray(160)));
+                    changed |= ui.add_sized([fw, 20.0], egui::TextEdit::singleline(&mut ed.buf_min)).changed();
+                    ui.label(egui::RichText::new("max").small().color(egui::Color32::from_gray(160)));
+                    changed |= ui.add_sized([fw, 20.0], egui::TextEdit::singleline(&mut ed.buf_max)).changed();
+                    ui.label(egui::RichText::new("def").small().color(egui::Color32::from_gray(160)));
+                    changed |= ui.add_sized([fw, 20.0], egui::TextEdit::singleline(&mut ed.buf_default)).changed();
+                    if changed { ed.apply_edit(); ed.validate_buffers(); }
+                });
+                ui.end_row();
+            });
             ui.add_space(6.0);
-
-            // Range bar
             let min_v: f64 = ed.buf_min.parse().unwrap_or(-1.0);
             let max_v: f64 = ed.buf_max.parse().unwrap_or(1.0);
             let def_v: f64 = ed.buf_default.parse().unwrap_or(0.0);
-            let t = if (max_v - min_v).abs() > 1e-9 {
-                ((def_v - min_v) / (max_v - min_v)).clamp(0.0, 1.0) as f32
-            } else { 0.5 };
-
+            let t = if (max_v - min_v).abs() > 1e-9 { ((def_v - min_v) / (max_v - min_v)).clamp(0.0, 1.0) as f32 } else { 0.5 };
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!("{:.2}", min_v)).small().monospace().color(egui::Color32::from_gray(160)));
                 let bar_w = ui.available_width() - 44.0;
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(bar_w, 8.0), egui::Sense::hover());
                 ui.painter().rect_filled(rect, 3.0, egui::Color32::from_gray(50));
                 let fill = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * t, rect.height()));
-                ui.painter().rect_filled(fill, 3.0, egui::Color32::from_rgb(80, 160, 240));
-                let tick_x = rect.min.x + rect.width() * t;
-                ui.painter().line_segment(
-                    [egui::pos2(tick_x, rect.min.y - 2.0), egui::pos2(tick_x, rect.max.y + 2.0)],
-                    egui::Stroke::new(1.5, egui::Color32::WHITE),
-                );
+                ui.painter().rect_filled(fill, 3.0, egui::Color32::from_rgb(80,160,240));
+                let tx = rect.min.x + rect.width() * t;
+                ui.painter().line_segment([egui::pos2(tx, rect.min.y-2.0), egui::pos2(tx, rect.max.y+2.0)], egui::Stroke::new(1.5, egui::Color32::WHITE));
                 ui.label(egui::RichText::new(format!("{:.2}", max_v)).small().monospace().color(egui::Color32::from_gray(160)));
             });
-
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(4.0);
-
-            egui::CollapsingHeader::new(egui::RichText::new("Available variables").small())
-                .default_open(false)
-                .show(ui, |ui| {
-                    let vars = [
-                        ("Head rotation",   "HeadRotX  HeadRotY  HeadRotZ"),
-                        ("Head position",   "HeadPosX  HeadPosY  HeadPosZ"),
-                        ("Eyes",            "EyeBlinkLeft  EyeBlinkRight"),
-                        ("Mouth",           "JawOpen  MouthSmileLeft  MouthSmileRight\nMouthFrownLeft  MouthFrownRight"),
-                        ("Brows",           "BrowOuterUpLeft  BrowOuterUpRight"),
-                    ];
-                    egui::Grid::new("vars_grid").num_columns(2).spacing([8.0, 2.0]).show(ui, |ui| {
-                        for (cat, names) in &vars {
-                            ui.label(egui::RichText::new(*cat).small().color(egui::Color32::from_gray(140)));
-                            ui.label(egui::RichText::new(*names).small().monospace().color(egui::Color32::from_gray(200)));
-                            ui.end_row();
-                        }
-                    });
-                    ui.add_space(2.0);
-                    ui.label(egui::RichText::new("Operators: + - * / ^ ( ) math functions").small().color(egui::Color32::from_gray(130)));
+            egui::CollapsingHeader::new(egui::RichText::new("Available variables").small()).default_open(false).show(ui, |ui| {
+                let vars = [
+                    ("Head rotation", "HeadRotX  HeadRotY  HeadRotZ"),
+                    ("Head position", "HeadPosX  HeadPosY  HeadPosZ"),
+                    ("Eyes",          "EyeBlinkLeft  EyeBlinkRight"),
+                    ("Mouth",         "JawOpen  MouthSmileLeft  MouthSmileRight\nMouthFrownLeft  MouthFrownRight"),
+                    ("Brows",         "BrowOuterUpLeft  BrowOuterUpRight"),
+                ];
+                egui::Grid::new("vars_grid").num_columns(2).spacing([8.0, 2.0]).show(ui, |ui| {
+                    for (cat, names) in &vars {
+                        ui.label(egui::RichText::new(*cat).small().color(egui::Color32::from_gray(140)));
+                        ui.label(egui::RichText::new(*names).small().monospace().color(egui::Color32::from_gray(200)));
+                        ui.end_row();
+                    }
                 });
+                ui.label(egui::RichText::new("Operators: + - * / ^ ( ) math functions").small().color(egui::Color32::from_gray(130)));
+            });
         });
     });
 }
@@ -931,85 +987,50 @@ fn settings_ui(
 ) {
     ui.add_space(4.0);
     egui::ScrollArea::vertical().show(ui, |ui| {
-        // Connection section
         ui.label(egui::RichText::new("Connection").strong());
         ui.separator();
-        egui::Grid::new("conn_grid")
-            .num_columns(2)
-            .spacing([12.0, 6.0])
-            .min_col_width(120.0)
-            .show(ui, |ui| {
-                ui.label("VTube Studio port");
-                let mut port_str = draft.vts_port.to_string();
-                let r = ui.add_sized([80.0, 20.0], egui::TextEdit::singleline(&mut port_str).hint_text("8001"));
-                if r.changed() {
-                    if let Ok(p) = port_str.parse::<u16>() {
-                        draft.vts_port = p;
-                    }
-                }
-                ui.end_row();
-
-                ui.label("Auto-reconnect");
-                ui.checkbox(&mut draft.auto_reconnect, "");
-                ui.end_row();
-
-                ui.add_enabled(
-                    draft.auto_reconnect,
-                    egui::Label::new("Reconnect delay (s)"),
-                );
-                ui.add_enabled(
-                    draft.auto_reconnect,
-                    egui::Slider::new(&mut draft.reconnect_delay_secs, 1..=30).suffix("s"),
-                );
-                ui.end_row();
-            });
+        egui::Grid::new("conn_grid").num_columns(2).spacing([12.0, 6.0]).min_col_width(120.0).show(ui, |ui| {
+            ui.label("VTube Studio port");
+            let mut port_str = draft.vts_port.to_string();
+            let r = ui.add_sized([80.0, 20.0], egui::TextEdit::singleline(&mut port_str).hint_text("8001"));
+            if r.changed() { if let Ok(p) = port_str.parse::<u16>() { draft.vts_port = p; } }
+            ui.end_row();
+            ui.label("Auto-reconnect");
+            ui.checkbox(&mut draft.auto_reconnect, "");
+            ui.end_row();
+            ui.add_enabled(draft.auto_reconnect, egui::Label::new("Reconnect delay (s)"));
+            ui.add_enabled(draft.auto_reconnect, egui::Slider::new(&mut draft.reconnect_delay_secs, 1..=30).suffix("s"));
+            ui.end_row();
+        });
 
         ui.add_space(10.0);
-
-        // Appearance section
         ui.label(egui::RichText::new("Appearance").strong());
         ui.separator();
-        egui::Grid::new("appear_grid")
-            .num_columns(2)
-            .spacing([12.0, 6.0])
-            .min_col_width(120.0)
-            .show(ui, |ui| {
-                ui.label("Theme");
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut draft.theme, "dark".into(), "Dark");
-                    ui.selectable_value(&mut draft.theme, "light".into(), "Light");
-                });
-                ui.end_row();
+        egui::Grid::new("appear_grid").num_columns(2).spacing([12.0, 6.0]).min_col_width(120.0).show(ui, |ui| {
+            ui.label("Theme");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut draft.theme, "dark".into(),  "Dark");
+                ui.selectable_value(&mut draft.theme, "light".into(), "Light");
             });
+            ui.end_row();
+        });
 
         ui.add_space(10.0);
-
-        // Logging section
         ui.label(egui::RichText::new("Logging").strong());
         ui.separator();
-        egui::Grid::new("log_grid")
-            .num_columns(2)
-            .spacing([12.0, 6.0])
-            .min_col_width(120.0)
-            .show(ui, |ui| {
-                ui.label("Log level");
-                ui.horizontal(|ui| {
-                    for level in ["error", "warn", "info", "debug"] {
-                        ui.selectable_value(
-                            &mut draft.log_level,
-                            level.to_string(),
-                            level.to_ascii_uppercase(),
-                        );
-                    }
-                });
-                ui.end_row();
+        egui::Grid::new("log_grid").num_columns(2).spacing([12.0, 6.0]).min_col_width(120.0).show(ui, |ui| {
+            ui.label("Log level");
+            ui.horizontal(|ui| {
+                for lvl in ["error", "warn", "info", "debug"] {
+                    ui.selectable_value(&mut draft.log_level, lvl.to_string(), lvl.to_ascii_uppercase());
+                }
             });
+            ui.end_row();
+        });
 
         ui.add_space(16.0);
         ui.separator();
         ui.add_space(6.0);
-
-        // Action buttons
         ui.horizontal(|ui| {
             let dirty = *draft != *settings;
             if ui.add_enabled(dirty, egui::Button::new("Save Settings")).clicked() {
@@ -1022,39 +1043,25 @@ fn settings_ui(
                 *status = "Reset to defaults (not saved)".into();
             }
         });
-
         if !status.is_empty() {
             ui.add_space(4.0);
-            let col = if status.starts_with("Saved") {
-                egui::Color32::from_rgb(80, 200, 100)
-            } else {
-                egui::Color32::from_gray(150)
-            };
+            let col = if status.starts_with("Saved") { egui::Color32::from_rgb(80,200,100) } else { egui::Color32::from_gray(150) };
             ui.label(egui::RichText::new(status.as_str()).small().color(col));
         }
 
         ui.add_space(12.0);
         ui.separator();
-
-        // Config file locations
         ui.add_space(6.0);
         ui.label(egui::RichText::new("Config files").strong());
         ui.add_space(3.0);
         let dir = app_dir().to_string_lossy().into_owned();
-        egui::Grid::new("paths_grid")
-            .num_columns(2)
-            .spacing([8.0, 4.0])
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new("App settings").small().color(egui::Color32::from_gray(140)));
-                ui.label(egui::RichText::new(format!("{}/settings.json", dir)).small().monospace().color(egui::Color32::from_gray(120)));
+        egui::Grid::new("paths_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+            for (label, file) in [("App settings", "settings.json"), ("UI config", "ui-cfg.json"), ("ONNX models", "face_det.onnx / face_lmk.onnx")] {
+                ui.label(egui::RichText::new(label).small().color(egui::Color32::from_gray(140)));
+                ui.label(egui::RichText::new(format!("{dir}/{file}")).small().monospace().color(egui::Color32::from_gray(110)));
                 ui.end_row();
-                ui.label(egui::RichText::new("UI config").small().color(egui::Color32::from_gray(140)));
-                ui.label(egui::RichText::new(format!("{}/ui-cfg.json", dir)).small().monospace().color(egui::Color32::from_gray(120)));
-                ui.end_row();
-                ui.label(egui::RichText::new("ONNX models").small().color(egui::Color32::from_gray(140)));
-                ui.label(egui::RichText::new(format!("{}/face_det.onnx", dir)).small().monospace().color(egui::Color32::from_gray(120)));
-                ui.end_row();
-            });
+            }
+        });
     });
 }
 
@@ -1064,150 +1071,77 @@ fn about_ui(ui: &mut egui::Ui) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.add_space(16.0);
         ui.vertical_centered(|ui| {
-            ui.label(
-                egui::RichText::new(APP_NAME)
-                    .size(24.0)
-                    .strong()
-                    .color(egui::Color32::from_rgb(100, 170, 255)),
-            );
+            ui.label(egui::RichText::new(APP_NAME).size(24.0).strong().color(egui::Color32::from_rgb(100, 170, 255)));
             ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(format!("v{VERSION}"))
-                    .size(13.0)
-                    .color(egui::Color32::from_gray(160)),
-            );
+            ui.label(egui::RichText::new(format!("v{VERSION}")).size(13.0).color(egui::Color32::from_gray(160)));
             ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new("Cross-platform bridge between face tracking")
-                    .color(egui::Color32::from_gray(200)),
-            );
-            ui.label(
-                egui::RichText::new("sources and VTube Studio.")
-                    .color(egui::Color32::from_gray(200)),
-            );
+            ui.label(egui::RichText::new("Cross-platform bridge between face tracking sources and VTube Studio.").color(egui::Color32::from_gray(200)));
             ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("Free & open-source alternative to VBridger.")
-                    .small()
-                    .color(egui::Color32::from_gray(140)),
-            );
+            ui.label(egui::RichText::new("Free & open-source alternative to VBridger.").small().color(egui::Color32::from_gray(140)));
         });
 
         ui.add_space(16.0);
         ui.separator();
         ui.add_space(10.0);
 
-        // Fork info
         ui.label(egui::RichText::new("Fork & Authors").strong());
         ui.add_space(4.0);
-        egui::Grid::new("authors_grid")
-            .num_columns(2)
-            .spacing([12.0, 5.0])
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new("Original project").color(egui::Color32::from_gray(150)));
-                ui.label(
-                    egui::RichText::new("rusty-bridge by ovROG")
-                        .monospace()
-                        .color(egui::Color32::from_gray(210)),
-                );
+        egui::Grid::new("authors_grid").num_columns(2).spacing([12.0, 5.0]).show(ui, |ui| {
+            let rows = [
+                ("Original project", "rusty-bridge by ovROG"),
+                ("This fork",        "rusty-bridger by LakoMoor"),
+                ("Repository",       "github.com/LakoMoor/rusty-bridger"),
+                ("Upstream",         "github.com/ovROG/rusty-bridge"),
+            ];
+            for (label, val) in rows {
+                ui.label(egui::RichText::new(label).color(egui::Color32::from_gray(150)));
+                ui.label(egui::RichText::new(val).monospace().small().color(egui::Color32::from_gray(210)));
                 ui.end_row();
-
-                ui.label(egui::RichText::new("This fork").color(egui::Color32::from_gray(150)));
-                ui.label(
-                    egui::RichText::new("rusty-bridger by LakoMoor")
-                        .monospace()
-                        .color(egui::Color32::from_gray(210)),
-                );
-                ui.end_row();
-
-                ui.label(egui::RichText::new("Repository").color(egui::Color32::from_gray(150)));
-                ui.label(
-                    egui::RichText::new("github.com/LakoMoor/rusty-bridger")
-                        .monospace()
-                        .small()
-                        .color(egui::Color32::from_rgb(80, 160, 255)),
-                );
-                ui.end_row();
-
-                ui.label(egui::RichText::new("Upstream").color(egui::Color32::from_gray(150)));
-                ui.label(
-                    egui::RichText::new("github.com/ovROG/rusty-bridge")
-                        .monospace()
-                        .small()
-                        .color(egui::Color32::from_rgb(80, 160, 255)),
-                );
-                ui.end_row();
-            });
+            }
+        });
 
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(10.0);
 
-        // License
         ui.label(egui::RichText::new("License").strong());
         ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new("GNU General Public License v3.0")
-                .color(egui::Color32::from_gray(210)),
-        );
+        ui.label(egui::RichText::new("GNU General Public License v3.0").color(egui::Color32::from_gray(210)));
         ui.add_space(2.0);
-        ui.label(
-            egui::RichText::new(
-                "This program is free software: you can redistribute it and/or modify\n\
-                 it under the terms of the GNU General Public License as published by\n\
-                 the Free Software Foundation, either version 3 of the License, or\n\
-                 (at your option) any later version.",
-            )
-            .small()
-            .color(egui::Color32::from_gray(140)),
-        );
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new(
-                "This program is distributed in the hope that it will be useful,\n\
-                 but WITHOUT ANY WARRANTY; without even the implied warranty of\n\
-                 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
-            )
-            .small()
-            .color(egui::Color32::from_gray(120)),
-        );
+        ui.label(egui::RichText::new(
+            "This program is free software: you can redistribute it and/or modify it\n\
+             under the terms of the GNU General Public License as published by the Free\n\
+             Software Foundation, either version 3 of the License, or (at your option)\n\
+             any later version. Distributed WITHOUT ANY WARRANTY."
+        ).small().color(egui::Color32::from_gray(130)));
 
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(10.0);
 
-        // Tech stack
         ui.label(egui::RichText::new("Built with").strong());
         ui.add_space(4.0);
         let libs = [
-            ("Rust", "Systems programming language"),
+            ("Rust",          "Systems programming language"),
             ("egui / eframe", "Immediate-mode GUI framework"),
-            ("ONNX Runtime", "Neural face tracking (webcam mode)"),
-            ("nokhwa", "Cross-platform camera capture"),
-            ("tungstenite", "WebSocket client for VTS API"),
-            ("evalexpr", "Transform formula evaluation"),
+            ("ONNX Runtime",  "Neural face tracking (webcam)"),
+            ("nokhwa",        "Cross-platform camera capture"),
+            ("tungstenite",   "WebSocket client for VTS API"),
+            ("evalexpr",      "Transform formula evaluation"),
         ];
-        egui::Grid::new("tech_grid")
-            .num_columns(2)
-            .spacing([12.0, 4.0])
-            .show(ui, |ui| {
-                for (name, desc) in libs {
-                    ui.label(egui::RichText::new(name).monospace().small().color(egui::Color32::from_gray(200)));
-                    ui.label(egui::RichText::new(desc).small().color(egui::Color32::from_gray(140)));
-                    ui.end_row();
-                }
-            });
+        egui::Grid::new("tech_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+            for (name, desc) in libs {
+                ui.label(egui::RichText::new(name).monospace().small().color(egui::Color32::from_gray(200)));
+                ui.label(egui::RichText::new(desc).small().color(egui::Color32::from_gray(140)));
+                ui.end_row();
+            }
+        });
 
-        ui.add_space(10.0);
+        ui.add_space(12.0);
         ui.separator();
         ui.add_space(8.0);
-
         ui.vertical_centered(|ui| {
-            ui.label(
-                egui::RichText::new("Copyright © 2024-2025  LakoMoor / ovROG")
-                    .small()
-                    .color(egui::Color32::from_gray(100)),
-            );
+            ui.label(egui::RichText::new("Copyright © 2024-2025  LakoMoor / ovROG").small().color(egui::Color32::from_gray(95)));
         });
         ui.add_space(8.0);
     });
@@ -1222,8 +1156,7 @@ fn main() {
     let log_dir  = data_dir.join("log");
     let _ = fs::create_dir_all(&log_dir);
     let log_file = log_dir.join("log.log").to_string_lossy().into_owned();
-    let log_cfg  = include_str!("../../configs/log_cfg.yml")
-        .replace("log/log.log", &log_file);
+    let log_cfg  = include_str!("../../configs/log_cfg.yml").replace("log/log.log", &log_file);
     if let Ok(raw) = serde_yaml::from_str(&log_cfg) {
         let _ = log4rs::init_raw_config(raw);
     }
@@ -1233,16 +1166,11 @@ fn main() {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_NAME)
-            .with_inner_size([480.0, 520.0])
-            .with_min_inner_size([380.0, 400.0])
+            .with_inner_size([480.0, 580.0])
+            .with_min_inner_size([380.0, 420.0])
             .with_resizable(true),
         ..Default::default()
     };
 
-    eframe::run_native(
-        APP_NAME,
-        options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
-    )
-    .unwrap();
+    eframe::run_native(APP_NAME, options, Box::new(|cc| Ok(Box::new(App::new(cc))))).unwrap();
 }

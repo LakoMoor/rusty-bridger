@@ -10,20 +10,20 @@ use std::{
 
 use log::warn;
 
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct Cords {
     pub x: f64,
     pub y: f64,
     pub z: f64,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct Shape {
     pub k: String,
     pub v: f64,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[serde(rename_all = "PascalCase")]
 pub struct TrackingResponce {
     pub timestamp: u64,

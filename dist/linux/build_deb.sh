@@ -12,9 +12,11 @@ PKG_DIR="$OUT_DIR/${APP_NAME}_${VERSION}_${ARCH}"
 DEB_PATH="$OUT_DIR/${APP_NAME}_${VERSION}_${ARCH}.deb"
 ICON_SRC="$WORKSPACE_ROOT/ui/resources/rb128.png"
 
-echo "Building release (v${VERSION})..."
-cd "$WORKSPACE_ROOT"
-cargo build --release -p rusty-bridge-ui
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+  echo "Building release (v${VERSION})..."
+  cd "$WORKSPACE_ROOT"
+  cargo build --release -p rusty-bridge-ui
+fi
 
 rm -rf "$PKG_DIR"
 mkdir -p "$PKG_DIR/DEBIAN"
@@ -31,7 +33,7 @@ Version: $VERSION
 Section: utils
 Priority: optional
 Architecture: $ARCH
-Depends: libc6 (>= 2.31), libgtk-3-0, libv4l-0
+Depends: libc6 (>= 2.31), libgtk-3-0
 Maintainer: LakoMoor <lakomoor@gmail.com>
 Homepage: https://github.com/LakoMoor/rusty-bridger
 Description: Rusty Bridger - VTube Studio face tracking bridge

@@ -4,18 +4,19 @@ setlocal
 set WORKSPACE=%~dp0..\..
 cd /d "%WORKSPACE%"
 
-echo Building release binary...
+echo Building Rusty Bridger release binary...
 cargo build --release -p rusty-bridge-ui
 if errorlevel 1 goto :error
 
 mkdir dist\out 2>nul
 
-echo Running NSIS...
+echo Running NSIS installer creator...
 cd dist\windows
 makensis installer.nsi
 if errorlevel 1 goto :error
 
-echo Done. Installer: dist\out\RustyBridge-0.1.0-windows-setup.exe
+echo.
+echo Done. Installer: dist\out\RustyBridger-0.2.0-windows-setup.exe
 goto :eof
 
 :error

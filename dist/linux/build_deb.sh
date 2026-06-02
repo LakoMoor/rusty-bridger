@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="rusty-bridge"
-VERSION="0.1.0"
+APP_NAME="rusty-bridger"
+VERSION=$(grep '^version' "$(dirname "$0")/../../ui/Cargo.toml" | head -1 | sed 's/.*"\(.*\)"/\1/')
 ARCH="amd64"
 BINARY="rusty-bridge-ui"
 WORKSPACE_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -12,7 +12,7 @@ PKG_DIR="$OUT_DIR/${APP_NAME}_${VERSION}_${ARCH}"
 DEB_PATH="$OUT_DIR/${APP_NAME}_${VERSION}_${ARCH}.deb"
 ICON_SRC="$WORKSPACE_ROOT/ui/resources/rb128.png"
 
-echo "Building release..."
+echo "Building release (v${VERSION})..."
 cd "$WORKSPACE_ROOT"
 cargo build --release -p rusty-bridge-ui
 
@@ -23,7 +23,7 @@ mkdir -p "$PKG_DIR/usr/share/applications"
 mkdir -p "$PKG_DIR/usr/share/pixmaps"
 
 cp "$RELEASE_BIN" "$PKG_DIR/usr/bin/$APP_NAME"
-[ -f "$ICON_SRC" ] && cp "$ICON_SRC" "$PKG_DIR/usr/share/pixmaps/rusty-bridge.png"
+[ -f "$ICON_SRC" ] && cp "$ICON_SRC" "$PKG_DIR/usr/share/pixmaps/$APP_NAME.png"
 
 cat > "$PKG_DIR/DEBIAN/control" <<CTRL
 Package: $APP_NAME
@@ -31,22 +31,26 @@ Version: $VERSION
 Section: utils
 Priority: optional
 Architecture: $ARCH
-Depends: libc6 (>= 2.31)
-Maintainer: ovROG <maintainer@example.com>
-Description: Rusty Bridge - VTube Studio motion bridge
- Cross-platform bridge for VTube Studio with iPhone and webcam
- face tracking support. Includes built-in config editor.
+Depends: libc6 (>= 2.31), libgtk-3-0, libv4l-0
+Maintainer: LakoMoor <lakomoor@gmail.com>
+Homepage: https://github.com/LakoMoor/rusty-bridger
+Description: Rusty Bridger - VTube Studio face tracking bridge
+ Cross-platform bridge between face tracking sources and VTube Studio.
+ Supports iPhone (via VTube Studio iOS app) and webcam (ONNX neural tracking).
+ Free and open-source alternative to VBridger. Fork of rusty-bridge by ovROG.
 CTRL
 
-cat > "$PKG_DIR/usr/share/applications/rusty-bridge.desktop" <<DESKTOP
+cat > "$PKG_DIR/usr/share/applications/$APP_NAME.desktop" <<DESKTOP
 [Desktop Entry]
-Name=Rusty Bridge
-Comment=VTube Studio motion bridge
+Name=Rusty Bridger
+GenericName=VTube Studio Bridge
+Comment=Face tracking bridge for VTube Studio
 Exec=/usr/bin/$APP_NAME
-Icon=rusty-bridge
+Icon=$APP_NAME
 Terminal=false
 Type=Application
-Categories=Utility;
+Categories=Utility;AudioVideo;
+Keywords=vtube;vtuber;face tracking;webcam;iphone;
 DESKTOP
 
 chmod 755 "$PKG_DIR/usr/bin/$APP_NAME"

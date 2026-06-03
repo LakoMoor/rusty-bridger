@@ -11,7 +11,7 @@ Supports **iPhone** (full ARKit blend shapes via VTube Studio iOS app) and **Web
 
 ## Download
 
-Go to [**Releases**](https://github.com/LakoMoor/rusty-bridger/releases/latest):
+Go to [**Releases**](https://github.com/LakoMoor/RBridger/releases/latest):
 
 | Platform | File |
 |----------|------|
@@ -194,8 +194,8 @@ Based on the original `ovrog.json` from [rusty-bridge by ovROG](https://github.c
 ## Building from source
 
 ```bash
-git clone https://github.com/LakoMoor/rusty-bridger.git
-cd rusty-bridger
+git clone https://github.com/LakoMoor/RBridger.git
+cd RBridger
 
 # UI only (no webcam)
 cargo build --release -p rbridger-ui
@@ -246,7 +246,7 @@ rbridger/
 ## Credits
 
 - Original project: [rusty-bridge](https://github.com/ovROG/rusty-bridge) by ovROG
-- This fork: [rbridger](https://github.com/LakoMoor/rusty-bridger) by LakoMoor
+- This fork: [rbridger](https://github.com/LakoMoor/RBridger) by LakoMoor
 
 ---
 

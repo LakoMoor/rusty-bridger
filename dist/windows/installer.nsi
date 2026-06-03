@@ -7,7 +7,7 @@
 !define APP_ID      "RBridger"
 !define VERSION     "0.2.0"
 !define PUBLISHER   "LakoMoor"
-!define URL         "https://github.com/LakoMoor/rusty-bridger"
+!define URL         "https://github.com/LakoMoor/RBridger"
 !define INSTALL_DIR "$PROGRAMFILES64\${APP_NAME}"
 
 Name "${APP_NAME} ${VERSION}"

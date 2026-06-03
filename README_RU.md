@@ -11,7 +11,7 @@
 
 ## Скачать
 
-Перейдите в [**Releases**](https://github.com/LakoMoor/rusty-bridger/releases/latest):
+Перейдите в [**Releases**](https://github.com/LakoMoor/RBridger/releases/latest):
 
 | Платформа | Файл |
 |-----------|------|
@@ -194,8 +194,8 @@ math::abs(MouthSmileLeft - MouthSmileRight)
 ## Сборка из исходного кода
 
 ```bash
-git clone https://github.com/LakoMoor/rusty-bridger.git
-cd rusty-bridger
+git clone https://github.com/LakoMoor/RBridger.git
+cd RBridger
 
 # Только UI (без веб-камеры)
 cargo build --release -p rbridger-ui
@@ -246,7 +246,7 @@ rbridger/
 ## Благодарности
 
 - Оригинальный проект: [rusty-bridge](https://github.com/ovROG/rusty-bridge) by ovROG
-- Этот форк: [rbridger](https://github.com/LakoMoor/rusty-bridger) by LakoMoor
+- Этот форк: [rbridger](https://github.com/LakoMoor/RBridger) by LakoMoor
 
 ---
 

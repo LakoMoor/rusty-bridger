@@ -23,7 +23,7 @@ use rbridger_lib::webcam::{init_camera_permissions, PreviewFrame, WebcamTracker}
 
 const APP_NAME:    &str = "RBridger";
 const VERSION:     &str = env!("CARGO_PKG_VERSION");
-const GITHUB_REPO: &str = "LakoMoor/rusty-bridger";
+const GITHUB_REPO: &str = "LakoMoor/RBridger";
 const OVROG_TEMPLATE: &str = include_str!("../../configs/ovrog.json");
 
 // ── Update checker ────────────────────────────────────────────────────────────
@@ -942,7 +942,7 @@ fn bridge_ui(ui: &mut egui::Ui, app: &mut App, connected: bool) {
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(6.0);
-    ui.label(egui::RichText::new("github.com/LakoMoor/rusty-bridger")
+    ui.label(egui::RichText::new("github.com/LakoMoor/RBridger")
         .small().color(egui::Color32::from_gray(85)));
 }
 
@@ -1283,7 +1283,7 @@ fn about_ui(
             for (label, val) in [
                 ("Original project", "rusty-bridge by ovROG"),
                 ("This fork",        "rbridger by LakoMoor"),
-                ("Repository",       "github.com/LakoMoor/rusty-bridger"),
+                ("Repository",       "github.com/LakoMoor/RBridger"),
                 ("Upstream",         "github.com/ovROG/rusty-bridge"),
             ] {
                 ui.label(egui::RichText::new(label).color(egui::Color32::from_gray(150)));

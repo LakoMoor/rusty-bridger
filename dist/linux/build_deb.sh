@@ -35,7 +35,7 @@ Priority: optional
 Architecture: $ARCH
 Depends: libc6 (>= 2.31), libgtk-3-0
 Maintainer: LakoMoor <lakomoor@gmail.com>
-Homepage: https://github.com/LakoMoor/rusty-bridger
+Homepage: https://github.com/LakoMoor/RBridger
 Description: RBridger - VTube Studio face tracking bridge
  Cross-platform bridge between face tracking sources and VTube Studio.
  Supports iPhone (via VTube Studio iOS app) and webcam (ONNX neural tracking).

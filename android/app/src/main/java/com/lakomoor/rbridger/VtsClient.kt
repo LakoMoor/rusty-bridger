@@ -19,7 +19,6 @@ class VtsClient(
     private val onHint: (String) -> Unit = {},
 ) {
     private val http = OkHttpClient.Builder()
-        .pingInterval(15, TimeUnit.SECONDS)
         .connectTimeout(10, TimeUnit.SECONDS)
         .build()
 

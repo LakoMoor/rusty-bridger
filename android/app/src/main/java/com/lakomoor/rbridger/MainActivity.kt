@@ -35,8 +35,9 @@ class MainActivity : ComponentActivity() {
     private var previewViewRef: PreviewView? = null
 
     private var connState by mutableStateOf(ConnState.DISCONNECTED)
+    private var hintMsg by mutableStateOf("")
     private var faceFound by mutableStateOf(false)
-    private var loadProgress by mutableStateOf(0f)        // -1 = ready, 0..1 = downloading
+    private var loadProgress by mutableStateOf(0f)   // -1 = ready, 0..1 = downloading
     private var loadError by mutableStateOf<String?>(null)
 
     private lateinit var vtsClient: VtsClient
@@ -51,7 +52,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        vtsClient = VtsClient { connState = it }
+        vtsClient = VtsClient(
+            onState = { connState = it },
+            onHint  = { hintMsg = it },
+        )
         tracker = FaceTracker(this) { data ->
             faceFound = data != null
             data?.let { vtsClient.injectFace(it) }
@@ -60,12 +64,10 @@ class MainActivity : ComponentActivity() {
         setContent {
             RBridgerTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    if (loadProgress >= 0f && loadError == null) {
-                        LoadingScreen(loadProgress)
-                    } else if (loadError != null) {
-                        ErrorScreen(loadError!!) { retryDownload() }
-                    } else {
-                        MainScreen()
+                    when {
+                        loadError != null       -> ErrorScreen(loadError!!) { retryDownload() }
+                        loadProgress >= 0f      -> LoadingScreen(loadProgress)
+                        else                    -> MainScreen()
                     }
                 }
             }
@@ -81,7 +83,7 @@ class MainActivity : ComponentActivity() {
             runCatching {
                 val modelFile = ModelManager.ensureModel(this@MainActivity) { p -> loadProgress = p }
                 tracker.initialize(modelFile)
-                loadProgress = -1f  // signals "ready"
+                loadProgress = -1f
             }.onFailure {
                 loadError = it.message ?: "Download failed"
             }
@@ -122,11 +124,14 @@ class MainActivity : ComponentActivity() {
     private fun MainScreen() {
         var host by remember { mutableStateOf("192.168.") }
         var port by remember { mutableStateOf("8001") }
-        val isConnected = connState == ConnState.CONNECTED
-        val isBusy = connState == ConnState.CONNECTING || connState == ConnState.AUTHENTICATING
+
+        val isConnected   = connState == ConnState.CONNECTED
+        val isApproving   = connState == ConnState.AWAITING_APPROVAL
+        val isBusy        = connState == ConnState.CONNECTING || connState == ConnState.AUTHENTICATING || isApproving
+        val isDisconnected = connState == ConnState.DISCONNECTED || connState == ConnState.ERROR
 
         Column(Modifier.fillMaxSize()) {
-            // Camera preview (top half)
+            // Camera preview
             AndroidView(
                 factory = { ctx ->
                     PreviewView(ctx).also { pv ->
@@ -140,7 +145,7 @@ class MainActivity : ComponentActivity() {
                 modifier = Modifier.fillMaxWidth().weight(1f),
             )
 
-            // Controls (bottom half)
+            // Controls
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -150,37 +155,48 @@ class MainActivity : ComponentActivity() {
                 // Status row
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     val dotColor = when (connState) {
-                        ConnState.CONNECTED     -> Color(0xFF4CAF50)
+                        ConnState.CONNECTED        -> Color(0xFF4CAF50)
                         ConnState.CONNECTING,
-                        ConnState.AUTHENTICATING -> Color(0xFFFFEB3B)
-                        ConnState.ERROR         -> Color(0xFFF44336)
-                        ConnState.DISCONNECTED  -> Color(0xFF757575)
+                        ConnState.AUTHENTICATING,
+                        ConnState.AWAITING_APPROVAL -> Color(0xFFFFEB3B)
+                        ConnState.ERROR            -> Color(0xFFF44336)
+                        ConnState.DISCONNECTED     -> Color(0xFF757575)
                     }
-                    Box(
-                        Modifier
-                            .size(10.dp)
-                            .background(dotColor, CircleShape)
-                    )
+                    Box(Modifier.size(10.dp).background(dotColor, CircleShape))
                     Spacer(Modifier.width(8.dp))
-                    Text(connState.name.lowercase().replaceFirstChar { it.uppercase() },
-                        style = MaterialTheme.typography.bodySmall)
+                    Text(
+                        when (connState) {
+                            ConnState.AWAITING_APPROVAL -> "Waiting for approval…"
+                            else -> connState.name.lowercase().replaceFirstChar { it.uppercase() }
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                    )
                     Spacer(Modifier.weight(1f))
                     if (faceFound && isConnected) {
-                        Text("Face ✓", style = MaterialTheme.typography.bodySmall,
-                            color = Color(0xFF4CAF50))
+                        Text("Face ✓", style = MaterialTheme.typography.bodySmall, color = Color(0xFF4CAF50))
                     }
                 }
 
-                Spacer(Modifier.height(12.dp))
+                // Hint / error message
+                if (hintMsg.isNotEmpty() && !isConnected) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        hintMsg,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (connState == ConnState.ERROR) Color(0xFFF44336) else Color(0xFFFFEB3B),
+                    )
+                }
+
+                Spacer(Modifier.height(10.dp))
 
                 OutlinedTextField(
                     value = host,
                     onValueChange = { host = it },
-                    label = { Text("VTube Studio IP") },
+                    label = { Text("VTube Studio PC IP") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-                    enabled = !isConnected && !isBusy,
+                    enabled = isDisconnected,
                 )
                 Spacer(Modifier.height(6.dp))
                 OutlinedTextField(
@@ -190,23 +206,28 @@ class MainActivity : ComponentActivity() {
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    enabled = !isConnected && !isBusy,
+                    enabled = isDisconnected,
                 )
 
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(10.dp))
 
                 Button(
                     onClick = {
-                        if (isConnected || isBusy) vtsClient.disconnect()
-                        else vtsClient.connect(host.trim(), port.trim().toIntOrNull() ?: 8001)
+                        if (!isDisconnected) {
+                            hintMsg = ""
+                            vtsClient.disconnect()
+                        } else {
+                            hintMsg = ""
+                            vtsClient.connect(host.trim(), port.trim().toIntOrNull() ?: 8001)
+                        }
                     },
                     modifier = Modifier.fillMaxWidth().height(48.dp),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (isConnected) Color(0xFFF44336)
+                        containerColor = if (isConnected || isApproving) Color(0xFFF44336)
                         else MaterialTheme.colorScheme.primary,
                     ),
                 ) {
-                    if (isBusy) {
+                    if (isBusy && !isApproving) {
                         CircularProgressIndicator(
                             modifier = Modifier.size(20.dp),
                             strokeWidth = 2.dp,
@@ -215,18 +236,19 @@ class MainActivity : ComponentActivity() {
                         Spacer(Modifier.width(8.dp))
                     }
                     Text(when (connState) {
-                        ConnState.CONNECTED      -> "Disconnect"
-                        ConnState.CONNECTING     -> "Connecting…"
-                        ConnState.AUTHENTICATING -> "Authenticating…"
-                        else                     -> "Connect to VTube Studio"
+                        ConnState.CONNECTED         -> "Disconnect"
+                        ConnState.CONNECTING        -> "Connecting…"
+                        ConnState.AUTHENTICATING    -> "Authenticating…"
+                        ConnState.AWAITING_APPROVAL -> "Cancel"
+                        else                        -> "Connect to VTube Studio"
                     })
                 }
 
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "Make sure VTube Studio is open on your PC and plugin API is enabled (port $port)",
+                    "PC and phone must be on the same Wi-Fi. Enable Plugin API in VTS Settings.",
                     style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f),
                 )
             }
         }

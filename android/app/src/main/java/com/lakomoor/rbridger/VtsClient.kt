@@ -12,10 +12,12 @@ import org.json.JSONObject
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
-enum class ConnState { DISCONNECTED, CONNECTING, AUTHENTICATING, CONNECTED, ERROR }
+enum class ConnState { DISCONNECTED, CONNECTING, AUTHENTICATING, AWAITING_APPROVAL, CONNECTED, ERROR }
 
-class VtsClient(private val onState: (ConnState) -> Unit) {
-
+class VtsClient(
+    private val onState: (ConnState) -> Unit,
+    private val onHint: (String) -> Unit = {},
+) {
     private val http = OkHttpClient.Builder()
         .pingInterval(15, TimeUnit.SECONDS)
         .connectTimeout(10, TimeUnit.SECONDS)
@@ -24,19 +26,21 @@ class VtsClient(private val onState: (ConnState) -> Unit) {
     private var ws: WebSocket? = null
     private var token: String? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var authRetryRunnable: Runnable? = null
 
-    // Custom setter notifies onState on the main thread
     var state = ConnState.DISCONNECTED
         private set(v) { field = v; mainHandler.post { onState(v) } }
 
     fun connect(host: String, port: Int = 8001) {
         if (state != ConnState.DISCONNECTED && state != ConnState.ERROR) return
+        cancelRetries()
         state = ConnState.CONNECTING
         val req = Request.Builder().url("ws://$host:$port").build()
         ws = http.newWebSocket(req, Listener())
     }
 
     fun disconnect() {
+        cancelRetries()
         ws?.close(1000, null)
         ws = null
         token = null
@@ -68,24 +72,56 @@ class VtsClient(private val onState: (ConnState) -> Unit) {
             val json = runCatching { JSONObject(text) }.getOrNull() ?: return
             when (json.optString("messageType")) {
                 "AuthenticationTokenResponse" -> {
-                    token = json.getJSONObject("data").getString("authenticationToken")
-                    authenticate(token!!)
+                    token = json.optJSONObject("data")?.optString("authenticationToken")
+                    // VTS just showed the approval popup — keep retrying until user clicks Allow
+                    state = ConnState.AWAITING_APPROVAL
+                    mainHandler.post { onHint("Approve RBridger in VTube Studio popup") }
+                    scheduleAuthRetry()
                 }
                 "AuthenticationResponse" -> {
-                    val ok = json.getJSONObject("data").getBoolean("authenticated")
-                    state = if (ok) ConnState.CONNECTED else ConnState.ERROR
+                    val ok = json.optJSONObject("data")?.optBoolean("authenticated") ?: false
+                    if (ok) {
+                        cancelRetries()
+                        state = ConnState.CONNECTED
+                    } else {
+                        // User hasn't approved yet — keep retrying every 2s
+                        if (state != ConnState.DISCONNECTED) scheduleAuthRetry()
+                    }
                 }
-                "APIError" -> state = ConnState.ERROR
+                "APIError" -> {
+                    val msg = json.optJSONObject("data")?.optString("message") ?: "API error"
+                    mainHandler.post { onHint(msg) }
+                    state = ConnState.ERROR
+                }
             }
         }
 
         override fun onFailure(ws: WebSocket, t: Throwable, r: Response?) {
+            cancelRetries()
+            mainHandler.post { onHint(t.message ?: "Connection failed") }
             state = ConnState.ERROR
         }
 
         override fun onClosed(ws: WebSocket, code: Int, reason: String) {
+            cancelRetries()
             state = ConnState.DISCONNECTED
         }
+    }
+
+    private fun scheduleAuthRetry() {
+        cancelRetries()
+        val r = Runnable {
+            if (token != null && state != ConnState.CONNECTED && state != ConnState.DISCONNECTED) {
+                authenticate(token!!)
+            }
+        }
+        authRetryRunnable = r
+        mainHandler.postDelayed(r, 2000)
+    }
+
+    private fun cancelRetries() {
+        authRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+        authRetryRunnable = null
     }
 
     private fun requestToken() = send(vtsMsg("AuthenticationTokenRequest", JSONObject()

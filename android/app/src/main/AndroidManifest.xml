@@ -11,7 +11,8 @@
         android:allowBackup="true"
         android:label="RBridger"
         android:theme="@style/Theme.AppCompat.DayNight.NoActionBar"
-        android:supportsRtl="true">
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="true">
 
         <activity
             android:name=".MainActivity"

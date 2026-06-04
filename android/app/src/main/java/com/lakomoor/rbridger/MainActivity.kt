@@ -53,6 +53,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         vtsClient = VtsClient(
+            context = this,
             onState = { connState = it },
             onHint  = { hintMsg = it },
         )

@@ -21,7 +21,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -121,7 +120,6 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun MainScreen() {
-        val context = LocalContext.current
         var host by remember { mutableStateOf("192.168.") }
         var port by remember { mutableStateOf("8001") }
         val isConnected = connState == ConnState.CONNECTED

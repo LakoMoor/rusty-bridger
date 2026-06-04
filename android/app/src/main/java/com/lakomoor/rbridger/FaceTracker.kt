@@ -1,5 +1,6 @@
 package com.lakomoor.rbridger
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.os.Handler
@@ -9,7 +10,6 @@ import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker
-import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerOptions
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
 import java.io.File
 
@@ -21,14 +21,15 @@ data class FaceData(
 )
 
 class FaceTracker(
-    private val context: android.content.Context,
+    private val context: Context,
     private val onResult: (FaceData?) -> Unit,
 ) {
     private var landmarker: FaceLandmarker? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     fun initialize(modelFile: File) {
-        val options = FaceLandmarkerOptions.builder()
+        // FaceLandmarkerOptions is a nested class inside FaceLandmarker
+        val options = FaceLandmarker.FaceLandmarkerOptions.builder()
             .setBaseOptions(
                 BaseOptions.builder()
                     .setModelAssetPath(modelFile.absolutePath)
@@ -38,8 +39,8 @@ class FaceTracker(
             .setNumFaces(1)
             .setOutputFaceBlendshapes(true)
             .setOutputFacialTransformationMatrixes(true)
-            .setResultListener { result, _ -> dispatchResult(result) }
-            .setErrorListener { it.printStackTrace() }
+            .setResultListener { result: FaceLandmarkerResult, _ -> dispatchResult(result) }
+            .setErrorListener { err -> err.printStackTrace() }
             .build()
 
         landmarker = FaceLandmarker.createFromOptions(context, options)
@@ -61,16 +62,17 @@ class FaceTracker(
     private fun buildFaceData(result: FaceLandmarkerResult): FaceData? {
         if (result.faceLandmarks().isEmpty()) return null
 
+        // faceBlendshapes() returns Optional<List<List<Category>>>
         val shapes = result.faceBlendshapes()
-            .firstOrNull()
+            .orElse(null)
+            ?.firstOrNull()
             ?.filter { it.categoryName() != "_neutral" }
             ?.map { it.categoryName() to it.score() }
             ?: emptyList()
 
         var pitch = 0f; var yaw = 0f; var roll = 0f
-        result.facialTransformationMatrixes().firstOrNull()?.let { mat ->
-            // Row-major 4x4 matrix — extract Euler angles from rotation submatrix
-            val m = mat.value
+        // facialTransformationMatrixes() returns Optional<List<float[]>> (row-major 4x4)
+        result.facialTransformationMatrixes().orElse(null)?.firstOrNull()?.let { m ->
             pitch = Math.toDegrees(Math.asin(-m[6].toDouble())).toFloat()
             yaw   = Math.toDegrees(Math.atan2(m[4].toDouble(), m[0].toDouble())).toFloat()
             roll  = Math.toDegrees(Math.atan2(m[9].toDouble(), m[10].toDouble())).toFloat()

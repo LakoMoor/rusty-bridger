@@ -25,12 +25,13 @@ class VtsClient(private val onState: (ConnState) -> Unit) {
     private var token: String? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    // Custom setter notifies onState on the main thread
     var state = ConnState.DISCONNECTED
         private set(v) { field = v; mainHandler.post { onState(v) } }
 
     fun connect(host: String, port: Int = 8001) {
         if (state != ConnState.DISCONNECTED && state != ConnState.ERROR) return
-        setState(ConnState.CONNECTING)
+        state = ConnState.CONNECTING
         val req = Request.Builder().url("ws://$host:$port").build()
         ws = http.newWebSocket(req, Listener())
     }
@@ -39,7 +40,7 @@ class VtsClient(private val onState: (ConnState) -> Unit) {
         ws?.close(1000, null)
         ws = null
         token = null
-        setState(ConnState.DISCONNECTED)
+        state = ConnState.DISCONNECTED
     }
 
     fun injectFace(data: FaceData) {
@@ -59,7 +60,7 @@ class VtsClient(private val onState: (ConnState) -> Unit) {
 
     private inner class Listener : WebSocketListener() {
         override fun onOpen(ws: WebSocket, response: Response) {
-            setState(ConnState.AUTHENTICATING)
+            state = ConnState.AUTHENTICATING
             if (token != null) authenticate(token!!) else requestToken()
         }
 
@@ -72,18 +73,18 @@ class VtsClient(private val onState: (ConnState) -> Unit) {
                 }
                 "AuthenticationResponse" -> {
                     val ok = json.getJSONObject("data").getBoolean("authenticated")
-                    setState(if (ok) ConnState.CONNECTED else ConnState.ERROR)
+                    state = if (ok) ConnState.CONNECTED else ConnState.ERROR
                 }
-                "APIError" -> setState(ConnState.ERROR)
+                "APIError" -> state = ConnState.ERROR
             }
         }
 
         override fun onFailure(ws: WebSocket, t: Throwable, r: Response?) {
-            setState(ConnState.ERROR)
+            state = ConnState.ERROR
         }
 
         override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-            setState(ConnState.DISCONNECTED)
+            state = ConnState.DISCONNECTED
         }
     }
 
@@ -106,6 +107,4 @@ class VtsClient(private val onState: (ConnState) -> Unit) {
         .toString()
 
     private fun send(text: String) = ws?.send(text)
-
-    private fun setState(s: ConnState) { state = s }
 }

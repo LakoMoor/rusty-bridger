@@ -209,7 +209,8 @@ jobs:
             libssl-dev \
             dpkg-dev \
             libv4l-dev \
-            libudev-dev
+            libudev-dev \
+            libayatana-appindicator3-dev
 
       - name: Build release
         run: cargo build --release -p rbridger-ui --features webcam

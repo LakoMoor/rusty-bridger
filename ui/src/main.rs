@@ -13,6 +13,10 @@ use std::{
 };
 
 use eframe::egui;
+use tray_icon::{
+    TrayIcon, TrayIconBuilder,
+    menu::{Menu, MenuEvent, MenuItem, MenuId, PredefinedMenuItem},
+};
 use rbridger_lib::{
     expr_app::ExprAppTracker,
     vtspc::{AfkConfig, CalcFn, VtsPc},
@@ -196,6 +200,31 @@ fn install_update(tmp: &std::path::Path, tx: Sender<UpdateDlState>) {
 
     #[allow(unreachable_code)]
     { let _ = tx.send(UpdateDlState::Failed("Auto-update not supported on this platform".into())); }
+}
+
+// ── Tray icon ─────────────────────────────────────────────────────────────────
+
+fn build_tray() -> Option<(TrayIcon, MenuId, MenuId)> {
+    let show_item = MenuItem::new("Open RBridger", true, None);
+    let quit_item = MenuItem::new("Exit", true, None);
+    let menu = Menu::new();
+    menu.append(&show_item).ok()?;
+    menu.append(&PredefinedMenuItem::separator()).ok()?;
+    menu.append(&quit_item).ok()?;
+
+    let bytes = include_bytes!("../resources/rb128.png");
+    let img   = image::load_from_memory(bytes).ok()?.into_rgba8();
+    let (w, h) = img.dimensions();
+    let icon  = tray_icon::Icon::from_rgba(img.into_raw(), w, h).ok()?;
+
+    let tray = TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip(APP_NAME)
+        .with_icon(icon)
+        .build()
+        .ok()?;
+
+    Some((tray, show_item.id().clone(), quit_item.id().clone()))
 }
 
 // ── Tracking source ───────────────────────────────────────────────────────────
@@ -463,6 +492,11 @@ struct App {
     update_open:     bool,
     update_dl_state: UpdateDlState,
     update_dl_rx:    Option<Receiver<UpdateDlState>>,
+    // System tray
+    tray:           Option<TrayIcon>,
+    tray_show_id:   Option<MenuId>,
+    tray_quit_id:   Option<MenuId>,
+    hidden:         bool,
 }
 
 impl App {
@@ -475,6 +509,11 @@ impl App {
 
         let (update_tx, update_rx) = mpsc::channel();
         thread::spawn(move || { let _ = update_tx.send(check_for_update()); });
+
+        let (tray_icon, tray_show_id, tray_quit_id) = match build_tray() {
+            Some((t, s, q)) => (Some(t), Some(s), Some(q)),
+            None            => (None, None, None),
+        };
 
         #[cfg(feature = "webcam")]
         init_camera_permissions();
@@ -541,6 +580,10 @@ impl App {
             update_open:     false,
             update_dl_state: UpdateDlState::Idle,
             update_dl_rx:    None,
+            tray:         tray_icon,
+            tray_show_id: tray_show_id,
+            tray_quit_id: tray_quit_id,
+            hidden:        false,
         }
     }
 
@@ -631,6 +674,48 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ── Tray: intercept window close ──────────────────────────────────────
+        if self.tray.is_some() && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.hidden = true;
+        }
+
+        // ── Tray events ───────────────────────────────────────────────────────
+        {
+            let mut show = false;
+            let mut quit = false;
+
+            while let Ok(ev) = tray_icon::TrayIconEvent::receiver().try_recv() {
+                if let tray_icon::TrayIconEvent::Click {
+                    button: tray_icon::MouseButton::Left,
+                    button_state: tray_icon::MouseButtonState::Up,
+                    ..
+                } = ev { show = true; }
+            }
+            while let Ok(ev) = MenuEvent::receiver().try_recv() {
+                if self.tray_show_id.as_ref().map_or(false, |id| id == &ev.id) { show = true; }
+                if self.tray_quit_id.as_ref().map_or(false, |id| id == &ev.id) { quit = true; }
+            }
+
+            if show {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.hidden = false;
+            }
+            if quit {
+                // Allow the real close this time
+                self.tray = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+
+        // While hidden, keep polling tray at low rate but skip rendering
+        if self.hidden {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            return;
+        }
+
         apply_theme(ctx, &self.settings_draft.theme);
 
         // Persist window size when it changes

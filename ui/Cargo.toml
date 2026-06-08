@@ -19,3 +19,5 @@ serde_yaml = "0.9.34"
 dirs = "5"
 evalexpr = "11.3"
 ureq = { version = "2", features = ["json"] }
+tray-icon = "0.14"
+image = { version = "0.25", default-features = false, features = ["png"] }

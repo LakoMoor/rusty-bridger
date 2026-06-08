@@ -199,6 +199,20 @@ impl Editor {
         self.dirty = true;
     }
 
+    fn quick_add(&mut self, name: &str, formula: &str, min: f64, max: f64, default: f64) {
+        self.apply_edit();
+        self.params.push(CalcFn {
+            name: name.to_string(),
+            func: formula.to_string(),
+            min,
+            max,
+            default_value: default,
+        });
+        self.dirty = true;
+        let idx = self.params.len() - 1;
+        self.select(idx);
+    }
+
     fn add_param(&mut self) {
         self.apply_edit();
         let idx = self.params.len();
@@ -1219,13 +1233,86 @@ fn config_editor_ui(
             .id_salt("editor_right")
             .show(ui, |ui| {
                 if ed.selected.is_none() {
-                    ui.add_space(8.0);
+                    // ── Quick Add constructor ────────────────────────────────
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Quick Add").strong().color(Color32::from_gray(210)));
+                    ui.add_space(2.0);
                     ui.label(
-                        RichText::new("Select a parameter on the left to edit it")
-                            .small()
-                            .color(Color32::from_gray(140)),
+                        RichText::new("Click any variable to add it as a parameter instantly:")
+                            .small().color(Color32::from_gray(140)),
                     );
+                    ui.add_space(10.0);
+
+                    let mut add_var: Option<(&str, f64, f64, f64)> = None;
+
+                    let groups: &[(&str, &[(&str, f64, f64, f64)])] = &[
+                        ("Head rotation", &[
+                            ("HeadRotX", -40.0, 40.0, 0.0), ("HeadRotY", -40.0, 40.0, 0.0), ("HeadRotZ", -40.0, 40.0, 0.0),
+                        ]),
+                        ("Head position", &[
+                            ("HeadPosX", -15.0, 15.0, 0.0), ("HeadPosY", -15.0, 15.0, 0.0), ("HeadPosZ", -15.0, 15.0, 0.0),
+                        ]),
+                        ("Eyes", &[
+                            ("EyeBlinkLeft", 0.0, 1.0, 0.0), ("EyeBlinkRight", 0.0, 1.0, 0.0),
+                            ("EyeWideLeft",  0.0, 1.0, 0.0), ("EyeWideRight",  0.0, 1.0, 0.0),
+                            ("EyeSquintLeft", 0.0, 1.0, 0.0), ("EyeSquintRight", 0.0, 1.0, 0.0),
+                        ]),
+                        ("Gaze", &[
+                            ("EyeLookUpLeft",   0.0, 1.0, 0.0), ("EyeLookUpRight",   0.0, 1.0, 0.0),
+                            ("EyeLookDownLeft", 0.0, 1.0, 0.0), ("EyeLookDownRight", 0.0, 1.0, 0.0),
+                            ("EyeLookInLeft",   0.0, 1.0, 0.0), ("EyeLookInRight",   0.0, 1.0, 0.0),
+                            ("EyeLookOutLeft",  0.0, 1.0, 0.0), ("EyeLookOutRight",  0.0, 1.0, 0.0),
+                        ]),
+                        ("Eyebrows", &[
+                            ("BrowOuterUpLeft", 0.0, 1.0, 0.0), ("BrowOuterUpRight", 0.0, 1.0, 0.0),
+                            ("BrowDownLeft",    0.0, 1.0, 0.0), ("BrowDownRight",    0.0, 1.0, 0.0),
+                            ("BrowInnerUp",     0.0, 1.0, 0.0),
+                        ]),
+                        ("Mouth", &[
+                            ("JawOpen",          0.0, 1.0, 0.0),
+                            ("MouthSmileLeft",   0.0, 1.0, 0.0), ("MouthSmileRight",  0.0, 1.0, 0.0),
+                            ("MouthFrownLeft",   0.0, 1.0, 0.0), ("MouthFrownRight",  0.0, 1.0, 0.0),
+                            ("MouthLeft",        0.0, 1.0, 0.0), ("MouthRight",       0.0, 1.0, 0.0),
+                            ("MouthPucker",      0.0, 1.0, 0.0), ("MouthFunnel",      0.0, 1.0, 0.0),
+                            ("MouthClose",       0.0, 1.0, 0.0),
+                            ("MouthRollUpper",   0.0, 1.0, 0.0), ("MouthRollLower",   0.0, 1.0, 0.0),
+                            ("MouthShrugUpper",  0.0, 1.0, 0.0), ("MouthShrugLower",  0.0, 1.0, 0.0),
+                            ("MouthDimpleLeft",  0.0, 1.0, 0.0), ("MouthDimpleRight", 0.0, 1.0, 0.0),
+                            ("MouthPressLeft",   0.0, 1.0, 0.0), ("MouthPressRight",  0.0, 1.0, 0.0),
+                        ]),
+                        ("Other", &[
+                            ("CheekPuff",     0.0, 1.0, 0.0),
+                            ("TongueOut",     0.0, 1.0, 0.0),
+                            ("NoseSneerLeft", 0.0, 1.0, 0.0), ("NoseSneerRight", 0.0, 1.0, 0.0),
+                        ]),
+                    ];
+
+                    for &(cat, vars) in groups {
+                        ui.label(RichText::new(cat).small().strong().color(Color32::from_gray(170)));
+                        ui.horizontal_wrapped(|ui| {
+                            for &(name, min, max, def) in vars {
+                                if ui.small_button(name)
+                                    .on_hover_text(format!("Add '{name}'  range {min}..{max}"))
+                                    .clicked()
+                                {
+                                    add_var = Some((name, min, max, def));
+                                }
+                            }
+                        });
+                        ui.add_space(3.0);
+                    }
+
+                    if let Some((name, min, max, def)) = add_var {
+                        ed.quick_add(name, name, min, max, def);
+                    }
+
                     ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Tip: after adding, edit Formula to combine variables,\ne.g.  JawOpen * 2   or   HeadRotY * -1")
+                            .small().italics().color(Color32::from_gray(115)),
+                    );
                 } else {
                     let w = right_w;
 
@@ -1292,29 +1379,29 @@ fn config_editor_ui(
                         );
                         ui.label(RichText::new(format!("{:.1}", max_v)).small().monospace().color(Color32::from_gray(150)));
                     });
-                }
 
-                // ── Variables reference ──────────────────────────────────────
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.label(RichText::new("Variables reference").small().strong().color(Color32::from_gray(180)));
-                ui.add_space(3.0);
-                let vars: &[(&str, &str)] = &[
-                    ("Head",   "HeadRotX  HeadRotY  HeadRotZ\nHeadPosX  HeadPosY  HeadPosZ"),
-                    ("Eyes",   "EyeBlinkLeft/Right   EyeWideLeft/Right\nEyeSquintLeft/Right"),
-                    ("Gaze",   "EyeLookUpLeft/Right  EyeLookDownLeft/Right\nEyeLookInLeft/Right  EyeLookOutLeft/Right"),
-                    ("Brows",  "BrowOuterUpLeft/Right  BrowDownLeft/Right\nBrowInnerUp"),
-                    ("Mouth",  "JawOpen  MouthSmileLeft/Right\nMouthFrownLeft/Right  MouthLeft  MouthRight\nMouthFunnel  MouthPucker  MouthRollLower/Upper\nMouthShrugUpper/Lower  MouthDimpleLeft/Right\nMouthUpperUpLeft/Right  MouthLowerDownLeft/Right\nMouthClose  MouthPressLeft/Right"),
-                    ("Other",  "CheekPuff  TongueOut\nNoseSneerLeft/Right\nmath::abs  math::sqrt  math::sin  ..."),
-                ];
-                egui::Grid::new("vars_ref").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-                    for (cat, names) in vars {
-                        ui.label(RichText::new(*cat).small().strong().color(Color32::from_gray(160)));
-                        ui.label(RichText::new(*names).small().monospace().color(Color32::from_gray(195)));
-                        ui.end_row();
-                    }
-                });
+                    // ── Variables reference (shown while editing) ────────────
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Variables reference").small().strong().color(Color32::from_gray(180)));
+                    ui.add_space(3.0);
+                    let vars: &[(&str, &str)] = &[
+                        ("Head",  "HeadRotX  HeadRotY  HeadRotZ\nHeadPosX  HeadPosY  HeadPosZ"),
+                        ("Eyes",  "EyeBlinkLeft/Right   EyeWideLeft/Right\nEyeSquintLeft/Right"),
+                        ("Gaze",  "EyeLookUpLeft/Right  EyeLookDownLeft/Right\nEyeLookInLeft/Right  EyeLookOutLeft/Right"),
+                        ("Brows", "BrowOuterUpLeft/Right  BrowDownLeft/Right\nBrowInnerUp"),
+                        ("Mouth", "JawOpen  MouthSmileLeft/Right\nMouthFrownLeft/Right  MouthLeft  MouthRight\nMouthFunnel  MouthPucker  MouthRollLower/Upper\nMouthShrugUpper/Lower  MouthDimpleLeft/Right\nMouthUpperUpLeft/Right  MouthLowerDownLeft/Right\nMouthClose  MouthPressLeft/Right"),
+                        ("Other", "CheekPuff  TongueOut\nNoseSneerLeft/Right\nmath::abs  math::sqrt  math::sin  ..."),
+                    ];
+                    egui::Grid::new("vars_ref").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                        for (cat, names) in vars {
+                            ui.label(RichText::new(*cat).small().strong().color(Color32::from_gray(160)));
+                            ui.label(RichText::new(*names).small().monospace().color(Color32::from_gray(195)));
+                            ui.end_row();
+                        }
+                    });
+                }
             }); // ScrollArea editor_right
             }); // allocate_ui right panel
     });

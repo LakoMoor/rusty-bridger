@@ -340,8 +340,14 @@ impl App {
         let mirror   = cfg.mirror.unwrap_or(false);
         let afk_mode = cfg.afk_mode.unwrap_or(false);
 
+        let transform_path = cfg.transform_path.clone().unwrap_or_default();
+        let mut editor = Editor::default();
+        if !transform_path.is_empty() {
+            editor.load_file(&transform_path);
+        }
+
         Self {
-            transform_path:  cfg.transform_path.clone().unwrap_or_default(),
+            transform_path,
             phone_ip:        cfg.ip.clone().unwrap_or_default(),
             source,
             expr_app_port:   cfg.expr_app_port.unwrap_or(9140).to_string(),
@@ -364,7 +370,7 @@ impl App {
             active:          Arc::new(AtomicBool::new(false)),
             vts_connected:   Arc::new(AtomicBool::new(false)),
             pending_path:    None,
-            editor:          Editor::default(),
+            editor,
             settings_status: String::new(),
             settings_draft,
             settings,
@@ -1204,6 +1210,8 @@ fn config_editor_ui(
         ui.separator();
 
         // Right: edit form + variables reference
+        ui.vertical(|ui| {
+        ui.set_min_width(right_w);
         egui::ScrollArea::vertical()
             .id_salt("editor_right")
             .max_height(avail_h)
@@ -1307,6 +1315,7 @@ fn config_editor_ui(
                     }
                 });
             });
+        }); // right vertical
     });
 }
 

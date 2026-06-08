@@ -1085,6 +1085,7 @@ fn config_editor_ui(
 
     // Left panel width: 38% of available, clamped to [130, 220]
     let left_w = (avail_w * 0.38).clamp(130.0, 220.0);
+    let right_w = (avail_w - left_w - 12.0).max(100.0);
 
     ui.horizontal(|ui| {
         // Left: scrollable param list
@@ -1129,7 +1130,7 @@ fn config_editor_ui(
                         ui.label(RichText::new("← Select a param to edit").color(Color32::from_gray(140)));
                     });
                 } else {
-                    let w = ui.available_width();
+                    let w = right_w;
 
                     ui.label(RichText::new("Name").small().color(Color32::from_gray(150)));
                     ui.horizontal(|ui| {

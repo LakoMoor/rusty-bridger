@@ -147,6 +147,7 @@ jobs:
             <key>CFBundlePackageType</key>        <string>APPL</string>
             <key>NSHighResolutionCapable</key>    <true/>
             <key>LSMinimumSystemVersion</key>     <string>11.0</string>
+            <key>NSCameraUsageDescription</key>   <string>Face tracking via webcam</string>
           </dict></plist>
           PLIST
           codesign --force --deep --sign - $APP

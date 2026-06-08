@@ -408,6 +408,7 @@ impl VtsPc {
         }
 
         let rot_y = if mirror { -raw_data.rotation.y } else { raw_data.rotation.y };
+        let rot_z = if mirror { -raw_data.rotation.z } else { raw_data.rotation.z };
         let pos_x = if mirror { -raw_data.position.x } else { raw_data.position.x };
 
         context.set_value("HeadPosX".into(), pos_x.into()).unwrap();
@@ -415,7 +416,7 @@ impl VtsPc {
         context.set_value("HeadPosZ".into(), raw_data.position.z.into()).unwrap();
         context.set_value("HeadRotX".into(), raw_data.rotation.x.into()).unwrap();
         context.set_value("HeadRotY".into(), rot_y.into()).unwrap();
-        context.set_value("HeadRotZ".into(), raw_data.rotation.z.into()).unwrap();
+        context.set_value("HeadRotZ".into(), rot_z.into()).unwrap();
 
         let face_found = raw_data.face_found;
 

@@ -1047,24 +1047,18 @@ fn config_editor_ui(
             }
             if !path.is_empty() { ed.save_file(path); }
         }
-        if ui.button("📋 Template").on_hover_text("Load ovrog default config").clicked() {
-            match serde_json::from_str::<Vec<CalcFn>>(OVROG_TEMPLATE) {
-                Ok(params) => {
-                    ed.params   = params;
-                    ed.selected = None;
-                    ed.dirty    = true;
-                    ed.status   = format!("Template loaded ({} params) — save when ready", ed.params.len());
-                }
-                Err(e) => { ed.status = format!("Template error: {e}"); }
-            }
+        if ui.button("📋 Template").on_hover_text("Load default config for most avatars").clicked() {
+            load_template(ed);
         }
         ui.separator();
         let has       = ed.selected.is_some();
         let not_first = ed.selected.map_or(false, |i| i > 0);
         let not_last  = ed.selected.map_or(false, |i| i + 1 < ed.params.len());
         if ui.button("＋ Add").clicked() { ed.add_param(); }
-        if ui.add_enabled(has && not_first, egui::Button::new("↑")).clicked() { ed.move_selected(true); }
-        if ui.add_enabled(has && not_last,  egui::Button::new("↓")).clicked() { ed.move_selected(false); }
+        if ui.add_enabled(has && not_first, egui::Button::new("Move up"))
+            .on_hover_text("Move parameter up").clicked() { ed.move_selected(true); }
+        if ui.add_enabled(has && not_last,  egui::Button::new("Move down"))
+            .on_hover_text("Move parameter down").clicked() { ed.move_selected(false); }
         if ui.add_enabled(has, egui::Button::new("🗑 Delete")).clicked() { ed.delete_selected(); }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1078,6 +1072,102 @@ fn config_editor_ui(
     });
 
     ui.separator();
+
+    // ── Quick-start screen when no params loaded ───────────────────────────────
+    if ed.params.is_empty() {
+        let avail_h = ui.available_height();
+        egui::ScrollArea::vertical().id_salt("qs_scroll").show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.set_max_width(460.0);
+                ui.add_space((avail_h * 0.10).max(20.0));
+
+                ui.label(RichText::new("Config Editor").size(18.0).strong().color(Color32::from_gray(220)));
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Configs map face-tracking values to VTube Studio custom parameters\n\
+                         using math expressions. Choose how to get started:"
+                    )
+                    .small()
+                    .color(Color32::from_gray(155)),
+                );
+                ui.add_space(22.0);
+
+                ui.horizontal(|ui| {
+                    let card_w = 195.0;
+
+                    // ── Template card ──────────────────────────────────────────
+                    egui::Frame::group(ui.style())
+                        .inner_margin(egui::Margin::same(14.0))
+                        .show(ui, |ui| {
+                            ui.set_min_width(card_w);
+                            ui.set_max_width(card_w);
+                            ui.vertical_centered(|ui| {
+                                ui.label(RichText::new("Recommended").small().color(Color32::from_rgb(70, 160, 230)));
+                                ui.add_space(4.0);
+                                ui.label(RichText::new("Default Template").strong().color(Color32::from_gray(220)));
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(
+                                        "Start with the default config\nfor most VTube Studio\navatars. Works immediately."
+                                    )
+                                    .small()
+                                    .color(Color32::from_gray(150)),
+                                );
+                                ui.add_space(10.0);
+                                if ui.button("  Use Template  ").clicked() {
+                                    load_template(ed);
+                                }
+                            });
+                        });
+
+                    ui.add_space(14.0);
+
+                    // ── Load file card ─────────────────────────────────────────
+                    egui::Frame::group(ui.style())
+                        .inner_margin(egui::Margin::same(14.0))
+                        .show(ui, |ui| {
+                            ui.set_min_width(card_w);
+                            ui.set_max_width(card_w);
+                            ui.vertical_centered(|ui| {
+                                ui.label(RichText::new("Have a config?").small().color(Color32::from_gray(140)));
+                                ui.add_space(4.0);
+                                ui.label(RichText::new("Load from File").strong().color(Color32::from_gray(220)));
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(
+                                        "Open an existing .json\nconfig file you already\nhave saved."
+                                    )
+                                    .small()
+                                    .color(Color32::from_gray(150)),
+                                );
+                                ui.add_space(10.0);
+                                if ui.button("  Open File  ").clicked() {
+                                    if let Some(p) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
+                                        let s = p.to_string_lossy().into_owned();
+                                        *path = s.clone();
+                                        cfg.transform_path = Some(s.clone());
+                                        cfg.save();
+                                        ed.load_file(&s);
+                                    }
+                                }
+                            });
+                        });
+                });
+
+                ui.add_space(18.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Advanced: click  \u{ff0b} Add  in the toolbar above to build parameters manually")
+                        .small()
+                        .color(Color32::from_gray(110)),
+                );
+                ui.add_space(20.0);
+            });
+        });
+        return;
+    }
 
     // ── Main area: param list + editor ─────────────────────────────────────────
     let avail_h = ui.available_height();
@@ -1108,11 +1198,6 @@ fn config_editor_ui(
                             ed.select(i);
                         }
                     }
-                    if ed.params.is_empty() {
-                        ui.add_space(12.0);
-                        ui.label(RichText::new("No params yet.\n\nPress 📋 Template to\nload a default config,\nor ＋ Add to create one.")
-                            .small().color(Color32::from_gray(120)));
-                    }
                 });
         });
 
@@ -1125,10 +1210,13 @@ fn config_editor_ui(
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if ed.selected.is_none() {
-                    ui.add_space(24.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("← Select a param to edit").color(Color32::from_gray(140)));
-                    });
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Select a parameter on the left to edit it")
+                            .small()
+                            .color(Color32::from_gray(140)),
+                    );
+                    ui.add_space(8.0);
                 } else {
                     let w = right_w;
 
@@ -1137,7 +1225,7 @@ fn config_editor_ui(
                         let r = ui.add_sized([(w - 60.0).max(60.0), 22.0], egui::TextEdit::singleline(&mut ed.buf_name));
                         if r.changed() { ed.apply_edit(); ed.validate_buffers(); }
                         if ed.name_dup {
-                            ui.label(RichText::new("⚠ dup").small().color(Color32::from_rgb(240, 160, 30)));
+                            ui.label(RichText::new("dup").small().color(Color32::from_rgb(240, 160, 30)));
                         }
                     });
 
@@ -1146,8 +1234,8 @@ fn config_editor_ui(
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Formula").small().color(Color32::from_gray(150)));
                         match ed.formula_ok {
-                            Some(true)  => { ui.label(RichText::new("✓").color(Color32::from_rgb(80, 200, 100))); }
-                            Some(false) => { ui.label(RichText::new("✗").color(Color32::from_rgb(220, 80, 80))); }
+                            Some(true)  => { ui.label(RichText::new("ok").small().color(Color32::from_rgb(80, 200, 100))); }
+                            Some(false) => { ui.label(RichText::new("err").small().color(Color32::from_rgb(220, 80, 80))); }
                             None => {}
                         }
                     });
@@ -1209,7 +1297,7 @@ fn config_editor_ui(
                     ("Gaze",   "EyeLookUpLeft/Right  EyeLookDownLeft/Right\nEyeLookInLeft/Right  EyeLookOutLeft/Right"),
                     ("Brows",  "BrowOuterUpLeft/Right  BrowDownLeft/Right\nBrowInnerUp"),
                     ("Mouth",  "JawOpen  MouthSmileLeft/Right\nMouthFrownLeft/Right  MouthLeft  MouthRight\nMouthFunnel  MouthPucker  MouthRollLower/Upper\nMouthShrugUpper/Lower  MouthDimpleLeft/Right\nMouthUpperUpLeft/Right  MouthLowerDownLeft/Right\nMouthClose  MouthPressLeft/Right"),
-                    ("Other",  "CheekPuff  TongueOut\nNoseSneerLeft/Right\nmath::abs  math::sqrt  math::sin  …"),
+                    ("Other",  "CheekPuff  TongueOut\nNoseSneerLeft/Right\nmath::abs  math::sqrt  math::sin  ..."),
                 ];
                 egui::Grid::new("vars_ref").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
                     for (cat, names) in vars {
@@ -1220,6 +1308,18 @@ fn config_editor_ui(
                 });
             });
     });
+}
+
+fn load_template(ed: &mut Editor) {
+    match serde_json::from_str::<Vec<CalcFn>>(OVROG_TEMPLATE) {
+        Ok(params) => {
+            ed.params   = params;
+            ed.selected = None;
+            ed.dirty    = true;
+            ed.status   = format!("Template loaded ({} params) — save when ready", ed.params.len());
+        }
+        Err(e) => { ed.status = format!("Template error: {e}"); }
+    }
 }
 
 // ── Settings tab ──────────────────────────────────────────────────────────────
